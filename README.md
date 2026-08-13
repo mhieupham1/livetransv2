@@ -4,7 +4,9 @@
 
 ## Tính năng
 
-- Ghi WebM/Opus trong trình duyệt, tự chia câu theo khoảng lặng và nhận dạng bằng Whisper-compatible API.
+- Ghi WebM/Opus trong trình duyệt, truyền audio theo WebSocket và hiển thị transcript tạm thời bằng Soniox realtime.
+- Tự chia lượt nói theo khoảng lặng, nhận diện ngôn ngữ và chuyển câu vào đúng khung Việt, Anh hoặc Nhật.
+- Tự động dùng lại endpoint HTTP transcription nếu kết nối realtime bị lỗi hoặc timeout.
 - Dịch streaming qua API tương thích OpenAI.
 - Phiên dịch một chiều hoặc hai chiều giữa Việt, Anh và Nhật.
 - Điều khiển session với thời lượng, tạm dừng và kết thúc.
@@ -27,10 +29,10 @@ cp .env.example .env
 Mở `.env` và điền một API key mới:
 
 ```dotenv
-LLM_BASE_URL=http://localhost:8001
+LLM_BASE_URL=http://localhost:3000
 LLM_API_KEY=replace-with-a-new-key
-LLM_MODEL=gpt-5-5-mini
-TRANSCRIPTION_MODEL=whisper-1
+LLM_MODEL=gpt-5-6-mini
+TRANSCRIPTION_MODEL=soniox-stt
 PORT=3001
 ```
 
@@ -62,4 +64,4 @@ npm run build
 
 Ghi âm WebM/Opus hoạt động tốt nhất trên Chrome, Edge và Firefox. Micro chỉ dùng được trên `localhost` hoặc website chạy HTTPS. Nếu trình duyệt không hỗ trợ MediaRecorder WebM, ô nhập tay vẫn hoạt động bình thường.
 
-Ứng dụng tự kết thúc một đoạn sau khoảng 700ms im lặng và gửi file tới `/v1/audio/transcriptions`. Đây là near-realtime theo lượt nói, không trả transcript tạm thời theo từng từ.
+Ứng dụng gửi chunk WebM/Opus khoảng mỗi 250ms qua `/v1/audio/transcriptions/realtime` và hiển thị transcript tạm thời trong lúc người dùng nói. Sau khoảng 1.200ms im lặng, ứng dụng commit đoạn audio, nhận transcript cuối cùng và bắt đầu lượt mới. API key chỉ được backend dùng để mở WebSocket upstream và không được gửi xuống trình duyệt.

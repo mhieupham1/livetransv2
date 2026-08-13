@@ -2,7 +2,9 @@ import "dotenv/config";
 import express from "express";
 import multer from "multer";
 import { existsSync } from "node:fs";
+import { createServer } from "node:http";
 import { resolve } from "node:path";
+import WebSocket, { RawData, WebSocketServer } from "ws";
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
@@ -14,6 +16,52 @@ const languages = {
 } as const;
 
 type LanguageCode = keyof typeof languages;
+
+function realtimeError(message: string) {
+  return JSON.stringify({
+    type: "error",
+    error: { type: "server_error", code: "realtime_proxy_error", message },
+  });
+}
+
+function sanitizeRealtimeSession(rawData: RawData) {
+  const event = JSON.parse(rawData.toString()) as {
+    type?: unknown;
+    session?: {
+      audio?: { input?: { transcription?: { languages?: unknown; prompt?: unknown; keywords?: unknown } } };
+    };
+  };
+  if (event.type !== "session.update" || !event.session || typeof event.session !== "object") {
+    throw new Error("Sự kiện đầu tiên phải là session.update.");
+  }
+  const transcription = event.session.audio?.input?.transcription;
+  const requestedLanguages = Array.isArray(transcription?.languages) ? transcription.languages : [];
+  const languageHints = requestedLanguages
+    .map((value) => String(value).trim().toLowerCase().split(/[-_]/, 1)[0])
+    .filter((value): value is LanguageCode => value in languages)
+    .filter((value, index, values) => values.indexOf(value) === index);
+  const prompt = typeof transcription?.prompt === "string" ? transcription.prompt.trim().slice(0, 1_000) : "";
+  const keywords = Array.isArray(transcription?.keywords)
+    ? transcription.keywords.map((value) => String(value).trim()).filter(Boolean).slice(0, 100)
+    : [];
+  return JSON.stringify({
+    type: "session.update",
+    session: {
+      type: "transcription",
+      audio: {
+        input: {
+          format: { type: "audio/webm" },
+          transcription: {
+            model: "soniox-stt",
+            ...(languageHints.length ? { languages: languageHints } : {}),
+            ...(prompt ? { prompt } : {}),
+            ...(keywords.length ? { keywords } : {}),
+          },
+        },
+      },
+    },
+  });
+}
 
 const transcriptionUpload = multer({
   storage: multer.memoryStorage(),
@@ -80,6 +128,13 @@ app.post(
     const durationMs = Number.isFinite(durationValue)
       ? Math.max(0, Math.round(durationValue))
       : undefined;
+    const prompt = typeof request.body.prompt === "string"
+      ? request.body.prompt.trim().slice(0, 1_000)
+      : "";
+    const requestedLanguage = typeof request.body.language === "string"
+      ? request.body.language.trim().toLowerCase().split(/[-_]/, 1)[0]
+      : "";
+    const language = requestedLanguage in languages ? requestedLanguage as LanguageCode : "";
     const baseUrl = (process.env.LLM_BASE_URL || "http://localhost:8001").replace(/\/$/, "");
     const model = process.env.TRANSCRIPTION_MODEL || "whisper-1";
     const controller = new AbortController();
@@ -96,6 +151,8 @@ app.post(
       form.append("model", model);
       form.append("response_format", "json");
       if (durationMs !== undefined) form.append("duration_ms", String(durationMs));
+      if (language) form.append("language", language);
+      if (prompt) form.append("prompt", prompt);
 
       const upstream = await fetch(`${baseUrl}/v1/audio/transcriptions`, {
         method: "POST",
@@ -394,6 +451,98 @@ if (existsSync(distPath)) {
   });
 }
 
-app.listen(port, "0.0.0.0", () => {
+const server = createServer(app);
+const realtimeServer = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024 });
+
+server.on("upgrade", (request, socket, head) => {
+  const pathname = new URL(request.url || "/", "http://localhost").pathname;
+  if (pathname !== "/api/transcribe/realtime") {
+    socket.destroy();
+    return;
+  }
+  realtimeServer.handleUpgrade(request, socket, head, (client) => {
+    realtimeServer.emit("connection", client, request);
+  });
+});
+
+realtimeServer.on("connection", (client) => {
+  const apiKey = process.env.LLM_API_KEY;
+  const model = process.env.TRANSCRIPTION_MODEL || "whisper-1";
+  if (!apiKey || model !== "soniox-stt") {
+    client.send(realtimeError(!apiKey
+      ? "Backend chưa được cấu hình API key."
+      : "Realtime transcription hiện chỉ hỗ trợ TRANSCRIPTION_MODEL=soniox-stt."));
+    client.close(1011, "realtime transcription unavailable");
+    return;
+  }
+
+  const baseUrl = new URL((process.env.LLM_BASE_URL || "http://localhost:8001").replace(/\/$/, ""));
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = `${baseUrl.pathname.replace(/\/$/, "")}/v1/audio/transcriptions/realtime`;
+  const upstream = new WebSocket(baseUrl, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    maxPayload: 25 * 1024 * 1024,
+  });
+  const pending: Array<{ data: RawData | string; binary: boolean }> = [];
+  let pendingBytes = 0;
+  let receivedSession = false;
+  let closed = false;
+
+  const closeBoth = () => {
+    if (closed) return;
+    closed = true;
+    if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) client.close();
+    if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) upstream.close();
+  };
+  const forward = (data: RawData | string, binary: boolean) => {
+    if (upstream.readyState === WebSocket.OPEN) {
+      upstream.send(data, { binary });
+      return;
+    }
+    const size = typeof data === "string"
+      ? Buffer.byteLength(data)
+      : Array.isArray(data) ? data.reduce((total, chunk) => total + chunk.byteLength, 0) : data.byteLength;
+    pendingBytes += size;
+    if (pendingBytes > 25 * 1024 * 1024) {
+      client.send(realtimeError("Audio realtime vượt quá giới hạn 25MB."));
+      closeBoth();
+      return;
+    }
+    pending.push({ data, binary });
+  };
+
+  client.on("message", (data, isBinary) => {
+    try {
+      if (!receivedSession) {
+        if (isBinary) throw new Error("Cần gửi session.update trước audio.");
+        receivedSession = true;
+        forward(sanitizeRealtimeSession(data), false);
+        return;
+      }
+      forward(data, isBinary);
+    } catch (error) {
+      client.send(realtimeError(error instanceof Error ? error.message : "Cấu hình realtime không hợp lệ."));
+      closeBoth();
+    }
+  });
+
+  upstream.on("open", () => {
+    for (const message of pending.splice(0)) upstream.send(message.data, { binary: message.binary });
+    pendingBytes = 0;
+  });
+  upstream.on("message", (data, isBinary) => {
+    if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+  });
+  upstream.on("error", (error) => {
+    console.error("Realtime transcription upstream error:", error.message);
+    if (client.readyState === WebSocket.OPEN) client.send(realtimeError("Không kết nối được tới Soniox realtime."));
+    closeBoth();
+  });
+  upstream.on("close", () => closeBoth());
+  client.on("error", () => closeBoth());
+  client.on("close", () => closeBoth());
+});
+
+server.listen(port, "0.0.0.0", () => {
   console.log(`Translation server listening on http://localhost:${port}`);
 });

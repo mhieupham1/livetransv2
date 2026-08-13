@@ -14,6 +14,8 @@ type SessionMode = "one-way" | "two-way";
 type SessionStatus = "idle" | "running" | "paused";
 type EntryStatus = "translating" | "done" | "error";
 type TextSize = "normal" | "large" | "extra-large" | "presentation";
+type RealtimePartial = { segmentId: string; text: string; language: LanguageCode };
+type RealtimeCompleted = { transcript: string; languages: string[] };
 
 type ConversationEntry = {
   id: string;
@@ -34,6 +36,7 @@ const LANGUAGES: Record<LanguageCode, { name: string; short: string; speechCode:
 
 const STORAGE_KEY = "relay-translation-session-v2";
 const TEXT_SIZE_STORAGE_KEY = "relay-transcript-text-size-v1";
+const SILENCE_COMMIT_MS = 1_200;
 const TEXT_SIZES: TextSize[] = ["normal", "large", "extra-large", "presentation"];
 const TEXT_SIZE_LABELS: Record<TextSize, string> = {
   normal: "100%",
@@ -58,6 +61,7 @@ const icons: Record<string, ReactNode> = {
   download: <><path d="M12 3v12m0 0 4-4m-4 4-4-4" /><path d="M5 19h14" /></>,
   settings: <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z" /></>,
   notes: <><path d="M6 3h12v18H6zM9 7h6M9 11h6M9 15h4" /></>,
+  trash: <><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6" /></>,
   send: <><path d="m21 3-7 18-3-8-8-3Z" /><path d="m21 3-10 10" /></>,
   close: <path d="m6 6 12 12M18 6 6 18" />,
   spark: <><path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2Z" /><path d="m18.5 14 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8Z" /></>,
@@ -107,6 +111,15 @@ function normalizeDetectedLanguage(value: string): LanguageCode | null {
   return null;
 }
 
+function realtimeWebSocketUrl() {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/transcribe/realtime`;
+}
+
+function cleanRealtimeTranscript(value: string) {
+  return value.replace(/<end>/gi, "").trim();
+}
+
 function loadHistory(): ConversationEntry[] {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
@@ -144,6 +157,8 @@ export default function App() {
   const [isSummarizing, setIsSummarizing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [apiConfigured, setApiConfigured] = useState<boolean | null>(null);
+  const [transcriptionModel, setTranscriptionModel] = useState("whisper-1");
+  const [realtimePartial, setRealtimePartial] = useState<RealtimePartial | null>(null);
 
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -155,6 +170,7 @@ export default function App() {
   const segmentSecondRef = useRef(0);
   const segmentLanguageRef = useRef<LanguageCode>("vi");
   const speechDetectedRef = useRef(false);
+  const speechStartedAtRef = useRef(0);
   const lastVoiceAtRef = useRef(0);
   const shouldTranscribeRef = useRef(false);
   const activeLanguageRef = useRef<LanguageCode>("vi");
@@ -162,6 +178,10 @@ export default function App() {
   const startedAtRef = useRef<number | null>(null);
   const elapsedBeforePauseRef = useRef(0);
   const controllersRef = useRef(new Map<string, AbortController>());
+  const conversationEpochRef = useRef(0);
+  const realtimeSocketsRef = useRef(new Set<WebSocket>());
+  const activeRealtimeSegmentRef = useRef("");
+  const beginRealtimeRef = useRef<() => void>(() => undefined);
   const transcribeAudioRef = useRef<(audio: Blob, durationMs: number, language: LanguageCode, sessionSecond: number) => void>(() => undefined);
   const startSegmentRef = useRef<() => void>(() => undefined);
   const panelEndsRef = useRef<Record<string, HTMLDivElement | null>>({});
@@ -174,11 +194,17 @@ export default function App() {
   const forwardEntries = useMemo(() => entries.filter((entry) => entry.source === source), [entries, source]);
   const reverseEntries = useMemo(() => entries.filter((entry) => entry.source === target), [entries, target]);
   const textSizeIndex = TEXT_SIZES.indexOf(textSize);
+  const transcriptionProvider = transcriptionModel === "soniox-stt"
+    ? "Soniox"
+    : transcriptionModel === "grok-stt" ? "Grok" : "Whisper";
 
   useEffect(() => {
     fetch("/api/health")
       .then((response) => response.json())
-      .then((data: { configured?: boolean }) => setApiConfigured(Boolean(data.configured)))
+      .then((data: { configured?: boolean; transcriptionModel?: string }) => {
+        setApiConfigured(Boolean(data.configured));
+        if (data.transcriptionModel) setTranscriptionModel(data.transcriptionModel);
+      })
       .catch(() => setApiConfigured(false));
   }, []);
 
@@ -290,7 +316,7 @@ export default function App() {
   }, [context, speakTranslation, updateEntry]);
 
   const submitText = useCallback((rawText: string, fromLanguage = activeLanguage, atSecond = elapsedRef.current) => {
-    const text = rawText.trim();
+    const text = cleanRealtimeTranscript(rawText);
     if (!text) return;
     const toLanguage = fromLanguage === source ? target : source;
     const entry: ConversationEntry = {
@@ -313,6 +339,40 @@ export default function App() {
     activeLanguageRef.current = activeLanguage;
   }, [activeLanguage]);
 
+  const routeTranscription = useCallback((
+    rawText: string,
+    detectedLanguages: string[],
+    fallbackLanguage: LanguageCode,
+    sessionSecond: number,
+  ) => {
+    const text = rawText.trim();
+    if (!text) return;
+    const rawLanguageCode = detectedLanguages.find((value) => value.trim())?.trim() || "";
+    const detectedLanguage = normalizeDetectedLanguage(rawLanguageCode);
+    if (rawLanguageCode && !detectedLanguage) {
+      const detail = rawLanguageCode.toLowerCase() === "noise"
+        ? `${transcriptionProvider} chỉ phát hiện tiếng ồn.`
+        : `${transcriptionProvider} phát hiện ngôn ngữ “${rawLanguageCode}”, không thuộc cặp ${LANGUAGES[source].name} ↔ ${LANGUAGES[target].name}.`;
+      setNotice(`${detail} Đoạn ghi âm đã được bỏ qua.`);
+      return;
+    }
+
+    const routedLanguage = detectedLanguage || fallbackLanguage;
+    if (routedLanguage !== source && routedLanguage !== target) {
+      setNotice(`Đoạn ghi âm không thuộc cặp ${LANGUAGES[source].name} ↔ ${LANGUAGES[target].name} và đã được bỏ qua.`);
+      return;
+    }
+    if (mode === "one-way" && routedLanguage !== source) {
+      setNotice(`${transcriptionProvider} phát hiện ${LANGUAGES[routedLanguage].name}. Chế độ một chiều chỉ nhận ${LANGUAGES[source].name}.`);
+      return;
+    }
+    if (detectedLanguage && mode === "two-way" && detectedLanguage !== activeLanguageRef.current) {
+      activeLanguageRef.current = detectedLanguage;
+      setActiveLanguage(detectedLanguage);
+    }
+    submitText(text, routedLanguage, sessionSecond);
+  }, [mode, source, submitText, target, transcriptionProvider]);
+
   const transcribeAudio = useCallback(async (
     audio: Blob,
     durationMs: number,
@@ -320,12 +380,14 @@ export default function App() {
     sessionSecond: number,
   ) => {
     if (audio.size < 500) return;
+    const conversationEpoch = conversationEpochRef.current;
     setTranscriptionCount((count) => count + 1);
     try {
       const form = new FormData();
       form.append("file", audio, "audio.webm");
-      form.append("model", "whisper-1");
       form.append("duration_ms", String(Math.round(durationMs)));
+      form.append("language", language);
+      if (context.trim()) form.append("prompt", context.trim());
 
       const response = await fetch("/api/transcribe", { method: "POST", body: form });
       const body = (await response.json().catch(() => null)) as {
@@ -334,39 +396,16 @@ export default function App() {
         error?: string;
       } | null;
       if (!response.ok) throw new Error(body?.error || `Không thể nhận giọng nói (HTTP ${response.status}).`);
+      if (conversationEpoch !== conversationEpochRef.current) return;
       const text = body?.text?.trim();
       if (!text) return;
-
-      const rawLanguageCode = body?.languageCode?.trim() || "";
-      const detectedLanguage = normalizeDetectedLanguage(rawLanguageCode);
-      if (rawLanguageCode && !detectedLanguage) {
-        const detail = rawLanguageCode.toLowerCase() === "noise"
-          ? "Grok chỉ phát hiện tiếng ồn."
-          : `Grok phát hiện ngôn ngữ “${rawLanguageCode}”, không thuộc cặp ${LANGUAGES[source].name} ↔ ${LANGUAGES[target].name}.`;
-        setNotice(`${detail} Đoạn ghi âm đã được bỏ qua.`);
-        return;
-      }
-
-      const routedLanguage = detectedLanguage || language;
-      if (routedLanguage !== source && routedLanguage !== target) {
-        setNotice(`Đoạn ghi âm không thuộc cặp ${LANGUAGES[source].name} ↔ ${LANGUAGES[target].name} và đã được bỏ qua.`);
-        return;
-      }
-      if (mode === "one-way" && routedLanguage !== source) {
-        setNotice(`Grok phát hiện ${LANGUAGES[routedLanguage].name}. Chế độ một chiều chỉ nhận ${LANGUAGES[source].name}.`);
-        return;
-      }
-      if (detectedLanguage && mode === "two-way" && detectedLanguage !== activeLanguageRef.current) {
-        activeLanguageRef.current = detectedLanguage;
-        setActiveLanguage(detectedLanguage);
-      }
-      submitText(text, routedLanguage, sessionSecond);
+      routeTranscription(text, [body?.languageCode || ""], language, sessionSecond);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Không thể nhận dạng đoạn ghi âm.");
     } finally {
       setTranscriptionCount((count) => Math.max(0, count - 1));
     }
-  }, [mode, source, submitText, target]);
+  }, [context, routeTranscription]);
 
   useEffect(() => {
     transcribeAudioRef.current = (audio, durationMs, language, sessionSecond) => {
@@ -381,37 +420,202 @@ export default function App() {
       ? "audio/webm;codecs=opus"
       : "audio/webm";
     const recorder = new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 32_000 });
+    const segmentId = makeId();
+    const segmentChunks: Blob[] = [];
+    const segmentLanguage = activeLanguageRef.current;
+    const languageHints = [segmentLanguage, source, target, ...Object.keys(LANGUAGES) as LanguageCode[]]
+      .filter((language, index, values) => values.indexOf(language) === index);
+    const sessionSecond = elapsedRef.current;
+    const conversationEpoch = conversationEpochRef.current;
+    let socket: WebSocket | null = null;
+    let sendChain = Promise.resolve();
+    let pendingFrames: ArrayBuffer[] = [];
+    let queuedChunkCount = 0;
+    let socketReady = false;
+    let socketFailure = "";
+    let settled = false;
+    let settleCompletion: (result: RealtimeCompleted | null) => void = () => undefined;
+    let settleReady: (ready: boolean) => void = () => undefined;
+    const completion = new Promise<RealtimeCompleted | null>((resolve) => { settleCompletion = resolve; });
+    const ready = new Promise<boolean>((resolve) => { settleReady = resolve; });
+    const settle = (result: RealtimeCompleted | null) => {
+      if (settled) return;
+      settled = true;
+      settleCompletion(result);
+    };
+
     mediaRecorderRef.current = recorder;
-    chunksRef.current = [];
+    activeRealtimeSegmentRef.current = segmentId;
+    setRealtimePartial(null);
+    chunksRef.current = segmentChunks;
     segmentStartedAtRef.current = performance.now();
-    segmentSecondRef.current = elapsedRef.current;
-    segmentLanguageRef.current = activeLanguageRef.current;
+    segmentSecondRef.current = sessionSecond;
+    segmentLanguageRef.current = segmentLanguage;
     speechDetectedRef.current = false;
+    speechStartedAtRef.current = 0;
     shouldTranscribeRef.current = false;
 
+    const beginRealtime = () => {
+      if (socket) {
+        queueAvailableChunks();
+        return;
+      }
+      if (transcriptionModel !== "soniox-stt") return;
+      const realtimeSocket = new WebSocket(realtimeWebSocketUrl());
+      socket = realtimeSocket;
+      realtimeSocketsRef.current.add(realtimeSocket);
+      realtimeSocket.onopen = () => {
+        socketReady = true;
+        settleReady(true);
+        realtimeSocket.send(JSON.stringify({
+          type: "session.update",
+          session: {
+            type: "transcription",
+            audio: {
+              input: {
+                format: { type: "audio/webm" },
+                transcription: {
+                  model: "soniox-stt",
+                  languages: languageHints,
+                  ...(context.trim() ? { prompt: context.trim() } : {}),
+                },
+              },
+            },
+          },
+        }));
+        for (const frame of pendingFrames) realtimeSocket.send(frame);
+        pendingFrames = [];
+      };
+      realtimeSocket.onmessage = (message) => {
+        try {
+          const event = JSON.parse(String(message.data)) as {
+            type?: string;
+            transcript?: string;
+            tokens?: Array<{ language?: string }>;
+            languages?: Array<{ code?: string } | string>;
+            error?: { message?: string };
+          };
+          if (event.type === "transcription.partial") {
+            if (activeRealtimeSegmentRef.current !== segmentId) return;
+            const tokenLanguage = event.tokens
+              ?.map((token) => normalizeDetectedLanguage(token.language || ""))
+              .reverse()
+              .find((language): language is LanguageCode => Boolean(language));
+            const partialLanguage = tokenLanguage && (tokenLanguage === source || tokenLanguage === target)
+              ? tokenLanguage
+              : segmentLanguage;
+            setRealtimePartial({
+              segmentId,
+              text: cleanRealtimeTranscript(event.transcript || ""),
+              language: partialLanguage,
+            });
+          } else if (event.type === "conversation.item.input_audio_transcription.completed") {
+            const detectedLanguages = (event.languages || []).map((language) => (
+              typeof language === "string" ? language : language.code || ""
+            ));
+            settle({ transcript: cleanRealtimeTranscript(event.transcript || ""), languages: detectedLanguages });
+          } else if (event.type === "error") {
+            socketFailure = event.error?.message || "Soniox realtime trả về lỗi.";
+            settle(null);
+          }
+        } catch {
+          socketFailure = "Soniox realtime trả về dữ liệu không hợp lệ.";
+          settle(null);
+        }
+      };
+      realtimeSocket.onerror = () => {
+        socketFailure = "Không kết nối được tới Soniox realtime.";
+        settleReady(false);
+        settle(null);
+      };
+      realtimeSocket.onclose = () => {
+        realtimeSocketsRef.current.delete(realtimeSocket);
+        if (!socketReady) settleReady(false);
+        settle(null);
+      };
+      queueAvailableChunks();
+    };
+    const queueAvailableChunks = () => {
+      if (!socket) return;
+      while (queuedChunkCount < segmentChunks.length) {
+        const chunk = segmentChunks[queuedChunkCount++];
+        sendChain = sendChain.then(async () => {
+          const frame = await chunk.arrayBuffer();
+          if (socket?.readyState === WebSocket.OPEN) socket.send(frame);
+          else if (socket?.readyState === WebSocket.CONNECTING) pendingFrames.push(frame);
+        });
+      }
+    };
+    beginRealtimeRef.current = beginRealtime;
+    beginRealtime();
+
     recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunksRef.current.push(event.data);
+      if (!event.data.size) return;
+      segmentChunks.push(event.data);
+      if (!speechDetectedRef.current) {
+        // Giữ header WebM và khoảng 2 giây pre-roll, không gửi thời gian im lặng dài lên Soniox.
+        if (segmentChunks.length > 9) segmentChunks.splice(1, segmentChunks.length - 9);
+        return;
+      }
+      queueAvailableChunks();
     };
     recorder.onerror = () => {
       setNotice("Trình duyệt gặp lỗi khi ghi âm WebM.");
     };
     recorder.onstop = () => {
       const durationMs = Math.max(0, performance.now() - segmentStartedAtRef.current);
-      const chunks = chunksRef.current;
       const shouldTranscribe = shouldTranscribeRef.current;
-      const language = segmentLanguageRef.current;
-      const sessionSecond = segmentSecondRef.current;
       chunksRef.current = [];
-      mediaRecorderRef.current = null;
+      if (mediaRecorderRef.current === recorder) mediaRecorderRef.current = null;
 
-      if (shouldTranscribe && chunks.length) {
-        const audio = new Blob(chunks, { type: mimeType });
-        transcribeAudioRef.current(audio, durationMs, language, sessionSecond);
+      if (shouldTranscribe && segmentChunks.length) {
+        const audio = new Blob(segmentChunks, { type: mimeType });
+        void (async () => {
+          if (!socket) {
+            transcribeAudioRef.current(audio, durationMs, segmentLanguage, sessionSecond);
+            return;
+          }
+          setTranscriptionCount((count) => count + 1);
+          let useFallback = false;
+          try {
+            await sendChain;
+            const isReady = await Promise.race([
+              ready,
+              new Promise<boolean>((resolve) => window.setTimeout(() => resolve(false), 8_000)),
+            ]);
+            if (!isReady || socket?.readyState !== WebSocket.OPEN) {
+              useFallback = true;
+              return;
+            }
+            socket.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+            const result = await Promise.race([
+              completion,
+              new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 25_000)),
+            ]);
+            if (!result || !result.transcript) {
+              useFallback = true;
+              return;
+            }
+            if (conversationEpoch !== conversationEpochRef.current) return;
+            routeTranscription(result.transcript, result.languages, segmentLanguage, sessionSecond);
+          } finally {
+            setRealtimePartial((current) => current?.segmentId === segmentId ? null : current);
+            setTranscriptionCount((count) => Math.max(0, count - 1));
+            if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close();
+            if (useFallback && conversationEpoch === conversationEpochRef.current) {
+              if (socketFailure) console.warn("Realtime transcription fallback:", socketFailure);
+              transcribeAudioRef.current(audio, durationMs, segmentLanguage, sessionSecond);
+            }
+          }
+        })();
+      } else {
+        setRealtimePartial((current) => current?.segmentId === segmentId ? null : current);
+        if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close();
       }
       if (captureActiveRef.current) window.setTimeout(() => startSegmentRef.current(), 30);
     };
-    recorder.start();
-  }, []);
+    recorder.start(250);
+  }, [context, routeTranscription, source, target, transcriptionModel]);
 
   useEffect(() => {
     startSegmentRef.current = startSegment;
@@ -472,19 +676,18 @@ export default function App() {
       for (const sample of samples) energy += sample * sample;
       const rms = Math.sqrt(energy / samples.length);
       const now = performance.now();
-      const segmentAge = now - segmentStartedAtRef.current;
 
       if (rms > 0.022) {
         lastVoiceAtRef.current = now;
         if (!speechDetectedRef.current) {
           speechDetectedRef.current = true;
+          speechStartedAtRef.current = now;
+          beginRealtimeRef.current();
           setIsSpeaking(true);
         }
-      } else if (speechDetectedRef.current && now - lastVoiceAtRef.current > 700) {
+      } else if (speechDetectedRef.current && now - lastVoiceAtRef.current > SILENCE_COMMIT_MS) {
         finishSegment(true);
-      } else if (!speechDetectedRef.current && segmentAge > 15_000) {
-        finishSegment(false);
-      } else if (speechDetectedRef.current && segmentAge > 30_000) {
+      } else if (speechDetectedRef.current && now - speechStartedAtRef.current > 30_000) {
         finishSegment(true);
       }
       vadFrameRef.current = requestAnimationFrame(monitorVoice);
@@ -494,6 +697,8 @@ export default function App() {
 
   useEffect(() => () => {
     controllersRef.current.forEach((controller) => controller.abort());
+    realtimeSocketsRef.current.forEach((socket) => socket.close());
+    realtimeSocketsRef.current.clear();
     window.speechSynthesis?.cancel();
     stopAudioCapture(false);
   }, [stopAudioCapture]);
@@ -581,6 +786,23 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const clearConversation = () => {
+    if (!entries.length) return;
+    if (!window.confirm("Xóa toàn bộ nội dung hội thoại? Hành động này không thể hoàn tác.")) return;
+    conversationEpochRef.current += 1;
+    controllersRef.current.forEach((controller) => controller.abort());
+    controllersRef.current.clear();
+    realtimeSocketsRef.current.forEach((socket) => socket.close());
+    realtimeSocketsRef.current.clear();
+    window.speechSynthesis?.cancel();
+    setEntries([]);
+    setRealtimePartial(null);
+    setSummary("");
+    setShowSummary(false);
+    setNotice(null);
+    localStorage.removeItem(STORAGE_KEY);
+  };
+
   const generateSummary = async () => {
     if (!entries.length) return;
     setShowSummary(true);
@@ -603,7 +825,7 @@ export default function App() {
   };
 
   const renderPanel = (from: LanguageCode, to: LanguageCode, panelEntries: ConversationEntry[], panelKey: string) => (
-    <section className={`transcript-panel ${activeLanguage === from && isListening ? "active-speaker" : ""}`}>
+    <section className={`transcript-panel ${(realtimePartial?.language || activeLanguage) === from && isListening ? "active-speaker" : ""}`}>
       <header className="panel-header">
         <div className="panel-language">
           <span>{LANGUAGES[from].short}</span>
@@ -623,7 +845,10 @@ export default function App() {
       </header>
 
       <div className="transcript-scroll" aria-live="polite">
-        {panelEntries.length === 0 && !(activeLanguage === from && (isSpeaking || transcriptionCount > 0)) ? (
+        {panelEntries.length === 0 && !(
+          (activeLanguage === from && (isSpeaking || transcriptionCount > 0))
+          || realtimePartial?.language === from
+        ) ? (
           <div className="panel-empty">
             <span><Icon name="mic" /></span>
             <strong>Chưa có nội dung</strong>
@@ -638,15 +863,20 @@ export default function App() {
             </p>
           </article>
         ))}
-        {activeLanguage === from && isSpeaking && (
+        {realtimePartial?.language === from ? (
+          <article className="transcript-entry interim realtime-partial">
+            <time>{isSpeaking ? "TRỰC TIẾP" : "ĐANG HOÀN TẤT"}</time>
+            <p className="original-text">{realtimePartial.text || "Đang nghe…"}</p>
+          </article>
+        ) : activeLanguage === from && isSpeaking && (
           <article className="transcript-entry interim">
             <time>ĐANG GHI</time>
-            <p className="original-text">Đang ghi âm lượt nói…</p>
+            <p className="original-text">Đang nghe và nhận dạng trực tiếp…</p>
           </article>
         )}
         {activeLanguage === from && !isSpeaking && transcriptionCount > 0 && (
           <article className="transcript-entry transcribing">
-            <time>WHISPER</time>
+            <time>{transcriptionProvider.toUpperCase()}</time>
             <p className="original-text">Đang nhận dạng giọng nói…</p>
           </article>
         )}
@@ -684,7 +914,8 @@ export default function App() {
 
         <div className="top-actions">
           <span className={`api-pill ${apiConfigured ? "ready" : ""}`}><i />{apiConfigured ? "AI sẵn sàng" : "Chưa có API"}</span>
-          <button onClick={() => setShowSettings(true)} aria-label="Cài đặt"><Icon name="settings" /></button>
+          <button className="danger-action" onClick={clearConversation} disabled={!entries.length} aria-label="Xóa hội thoại" title="Xóa toàn bộ hội thoại"><Icon name="trash" /></button>
+          <button onClick={() => setShowSettings(true)} aria-label="Cài đặt" title="Cài đặt"><Icon name="settings" /></button>
         </div>
       </header>
 
@@ -692,7 +923,7 @@ export default function App() {
         <section className="session-controls">
           <div className="audio-source">
             <span className={`source-icon ${isListening ? "live" : ""}`}><Icon name="mic" /></span>
-            <div><small>Nguồn âm thanh</small><strong>Microphone · Whisper</strong></div>
+            <div><small>Nguồn âm thanh</small><strong>Microphone · {transcriptionProvider}</strong></div>
           </div>
 
           <div className="transport">
@@ -757,12 +988,12 @@ export default function App() {
         <footer className="session-footer">
           <span><i className={sessionStatus === "running" ? "online" : ""} />{
             transcriptionCount > 0
-              ? `Whisper đang xử lý ${transcriptionCount} đoạn âm thanh`
+              ? `${transcriptionProvider} đang xử lý ${transcriptionCount} đoạn âm thanh`
               : sessionStatus === "running"
                 ? `${isSpeaking ? "Đang ghi âm" : "Đang chờ giọng nói"} · ${LANGUAGES[activeLanguage].name}`
                 : "Sẵn sàng bắt đầu"
           }</span>
-          <span>WebM/Opus · Whisper STT · AI translation</span>
+          <span>WebM/Opus · {transcriptionProvider} STT · AI translation</span>
         </footer>
       </main>
 

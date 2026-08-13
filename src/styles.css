@@ -81,6 +81,8 @@ button { color: inherit; }
   width: 36px; height: 36px; display: grid; place-items: center;
   color: #616771; background: #fff; border: 1px solid var(--line); border-radius: 9px; cursor: pointer;
 }
+.top-actions > button:disabled { opacity: .35; cursor: default; }
+.top-actions > button.danger-action:not(:disabled):hover { color: #c65334; background: #fff4ef; border-color: #f2cfc3; }
 .top-actions svg { width: 18px; }
 .api-pill {
   padding: 7px 11px; display: flex; align-items: center; gap: 7px;
@@ -230,6 +232,14 @@ button { color: inherit; }
 .translated-text.error { color: #c65334; font-size: 12px; font-weight: 500; }
 .transcript-entry.interim { padding: 11px; background: #fff7f3; border: 1px dashed #ffbea8; border-radius: 8px; }
 .transcript-entry.interim time { color: var(--accent); font-weight: 700; }
+.transcript-entry.realtime-partial {
+  position: sticky; bottom: 2px; z-index: 2; padding: 14px 15px;
+  background: rgba(255, 247, 243, .96); border-style: solid; border-left: 4px solid var(--accent);
+  box-shadow: 0 8px 24px rgba(48, 38, 34, .1); backdrop-filter: blur(8px);
+}
+.transcript-entry.realtime-partial .original-text {
+  color: #272b31; font-size: max(var(--original-text-size), 18px); font-weight: 600;
+}
 .transcript-entry.transcribing { padding: 11px; background: #f4f7ff; border: 1px dashed #b9caf7; border-radius: 8px; }
 .transcript-entry.transcribing time { color: var(--blue); font-weight: 700; }
 .typing { display: inline-flex; gap: 3px; }
