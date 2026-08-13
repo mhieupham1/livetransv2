@@ -13,6 +13,7 @@ type LanguageCode = "vi" | "en" | "ja";
 type SessionMode = "one-way" | "two-way";
 type SessionStatus = "idle" | "running" | "paused";
 type EntryStatus = "translating" | "done" | "error";
+type TextSize = "normal" | "large" | "extra-large" | "presentation";
 
 type ConversationEntry = {
   id: string;
@@ -32,6 +33,14 @@ const LANGUAGES: Record<LanguageCode, { name: string; short: string; speechCode:
 };
 
 const STORAGE_KEY = "relay-translation-session-v2";
+const TEXT_SIZE_STORAGE_KEY = "relay-transcript-text-size-v1";
+const TEXT_SIZES: TextSize[] = ["normal", "large", "extra-large", "presentation"];
+const TEXT_SIZE_LABELS: Record<TextSize, string> = {
+  normal: "100%",
+  large: "125%",
+  "extra-large": "160%",
+  presentation: "200%",
+};
 
 const icons: Record<string, ReactNode> = {
   mic: (
@@ -89,6 +98,15 @@ function makeId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+function normalizeDetectedLanguage(value: string): LanguageCode | null {
+  const normalized = value.trim().toLowerCase().replaceAll("_", "-");
+  const base = normalized.split("-", 1)[0];
+  if (["vi", "vie", "vietnamese"].includes(base)) return "vi";
+  if (["en", "eng", "english"].includes(base)) return "en";
+  if (["ja", "jp", "jpn", "japanese"].includes(base)) return "ja";
+  return null;
+}
+
 function loadHistory(): ConversationEntry[] {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
@@ -98,6 +116,11 @@ function loadHistory(): ConversationEntry[] {
   } catch {
     return [];
   }
+}
+
+function loadTextSize(): TextSize {
+  const saved = localStorage.getItem(TEXT_SIZE_STORAGE_KEY);
+  return TEXT_SIZES.includes(saved as TextSize) ? saved as TextSize : "normal";
 }
 
 export default function App() {
@@ -112,7 +135,8 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [transcriptionCount, setTranscriptionCount] = useState(0);
-  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [textSize, setTextSize] = useState<TextSize>(loadTextSize);
   const [context, setContext] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showSummary, setShowSummary] = useState(false);
@@ -149,6 +173,7 @@ export default function App() {
   );
   const forwardEntries = useMemo(() => entries.filter((entry) => entry.source === source), [entries, source]);
   const reverseEntries = useMemo(() => entries.filter((entry) => entry.source === target), [entries, target]);
+  const textSizeIndex = TEXT_SIZES.indexOf(textSize);
 
   useEffect(() => {
     fetch("/api/health")
@@ -162,6 +187,15 @@ export default function App() {
     panelEndsRef.current.forward?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     panelEndsRef.current.reverse?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [entries]);
+
+  useEffect(() => {
+    localStorage.setItem(TEXT_SIZE_STORAGE_KEY, textSize);
+  }, [textSize]);
+
+  const adjustTextSize = (direction: -1 | 1) => {
+    const nextIndex = Math.min(TEXT_SIZES.length - 1, Math.max(0, textSizeIndex + direction));
+    setTextSize(TEXT_SIZES[nextIndex]);
+  };
 
   useEffect(() => {
     if (sessionStatus !== "running") return;
@@ -294,16 +328,45 @@ export default function App() {
       form.append("duration_ms", String(Math.round(durationMs)));
 
       const response = await fetch("/api/transcribe", { method: "POST", body: form });
-      const body = (await response.json().catch(() => null)) as { text?: string; error?: string } | null;
+      const body = (await response.json().catch(() => null)) as {
+        text?: string;
+        languageCode?: string;
+        error?: string;
+      } | null;
       if (!response.ok) throw new Error(body?.error || `Không thể nhận giọng nói (HTTP ${response.status}).`);
       const text = body?.text?.trim();
-      if (text) submitText(text, language, sessionSecond);
+      if (!text) return;
+
+      const rawLanguageCode = body?.languageCode?.trim() || "";
+      const detectedLanguage = normalizeDetectedLanguage(rawLanguageCode);
+      if (rawLanguageCode && !detectedLanguage) {
+        const detail = rawLanguageCode.toLowerCase() === "noise"
+          ? "Grok chỉ phát hiện tiếng ồn."
+          : `Grok phát hiện ngôn ngữ “${rawLanguageCode}”, không thuộc cặp ${LANGUAGES[source].name} ↔ ${LANGUAGES[target].name}.`;
+        setNotice(`${detail} Đoạn ghi âm đã được bỏ qua.`);
+        return;
+      }
+
+      const routedLanguage = detectedLanguage || language;
+      if (routedLanguage !== source && routedLanguage !== target) {
+        setNotice(`Đoạn ghi âm không thuộc cặp ${LANGUAGES[source].name} ↔ ${LANGUAGES[target].name} và đã được bỏ qua.`);
+        return;
+      }
+      if (mode === "one-way" && routedLanguage !== source) {
+        setNotice(`Grok phát hiện ${LANGUAGES[routedLanguage].name}. Chế độ một chiều chỉ nhận ${LANGUAGES[source].name}.`);
+        return;
+      }
+      if (detectedLanguage && mode === "two-way" && detectedLanguage !== activeLanguageRef.current) {
+        activeLanguageRef.current = detectedLanguage;
+        setActiveLanguage(detectedLanguage);
+      }
+      submitText(text, routedLanguage, sessionSecond);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Không thể nhận dạng đoạn ghi âm.");
     } finally {
       setTranscriptionCount((count) => Math.max(0, count - 1));
     }
-  }, [submitText]);
+  }, [mode, source, submitText, target]);
 
   useEffect(() => {
     transcribeAudioRef.current = (audio, durationMs, language, sessionSecond) => {
@@ -607,7 +670,7 @@ export default function App() {
   );
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell text-size-${textSize}`}>
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark"><Icon name="spark" /></span>
@@ -668,10 +731,19 @@ export default function App() {
             </select>
           </div>
 
-          <div className="speaker-switch" aria-label="Chọn người đang nói">
-            <span>Đang nghe:</span>
-            <button className={activeLanguage === source ? "active" : ""} onClick={() => switchSpeaker(source)}>{LANGUAGES[source].name}</button>
-            {mode === "two-way" && <button className={activeLanguage === target ? "active" : ""} onClick={() => switchSpeaker(target)}>{LANGUAGES[target].name}</button>}
+          <div className="toolbar-right">
+            <div className="text-size-control" aria-label="Cỡ chữ transcript">
+              <span>Cỡ chữ</span>
+              <button onClick={() => adjustTextSize(-1)} disabled={textSizeIndex === 0} aria-label="Thu nhỏ chữ">A−</button>
+              <output aria-live="polite">{TEXT_SIZE_LABELS[textSize]}</output>
+              <button onClick={() => adjustTextSize(1)} disabled={textSizeIndex === TEXT_SIZES.length - 1} aria-label="Phóng to chữ">A+</button>
+            </div>
+
+            <div className="speaker-switch" aria-label="Chọn người đang nói">
+              <span>Đang nghe:</span>
+              <button className={activeLanguage === source ? "active" : ""} onClick={() => switchSpeaker(source)}>{LANGUAGES[source].name}</button>
+              {mode === "two-way" && <button className={activeLanguage === target ? "active" : ""} onClick={() => switchSpeaker(target)}>{LANGUAGES[target].name}</button>}
+            </div>
           </div>
         </section>
 
@@ -701,6 +773,16 @@ export default function App() {
             <label htmlFor="translation-context">Từ khóa và ngữ cảnh</label>
             <textarea id="translation-context" name="translation-context" value={context} onChange={(event) => setContext(event.target.value)} maxLength={1000} placeholder="Ví dụ: Cuộc họp về phần mềm y tế. Tên sản phẩm: MedFlow. Giữ nguyên các từ API, deployment…" />
             <div className="char-count">{context.length}/1000</div>
+            <div className="text-size-setting">
+              <span><strong>Cỡ chữ transcript</strong><small>Phóng to nguyên văn và bản dịch trên cả hai khung</small></span>
+              <div>
+                {TEXT_SIZES.map((size) => (
+                  <button key={size} className={textSize === size ? "active" : ""} onClick={() => setTextSize(size)}>
+                    {TEXT_SIZE_LABELS[size]}
+                  </button>
+                ))}
+              </div>
+            </div>
             <label className="toggle-row"><span><strong>Phát giọng bản dịch</strong><small>Đọc bản dịch sau mỗi câu hoàn chỉnh</small></span><input type="checkbox" checked={voiceEnabled} onChange={(event) => setVoiceEnabled(event.target.checked)} /></label>
             <footer><button className="primary-button" onClick={() => setShowSettings(false)}>Lưu cài đặt</button></footer>
           </section>

@@ -111,9 +111,13 @@ app.post(
         return;
       }
 
-      const data = (await upstream.json()) as { text?: unknown };
+      const data = (await upstream.json()) as { text?: unknown; languageCode?: unknown; language?: unknown };
       const text = typeof data.text === "string" ? data.text.trim() : "";
-      response.json({ text });
+      const rawLanguageCode = typeof data.languageCode === "string"
+        ? data.languageCode
+        : typeof data.language === "string" ? data.language : "";
+      const languageCode = rawLanguageCode.trim();
+      response.json(languageCode ? { text, languageCode } : { text });
     } catch (error) {
       if (controller.signal.aborted) return;
       console.error("Transcription request failed:", error);

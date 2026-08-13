@@ -22,7 +22,30 @@ body { margin: 0; min-height: 100vh; background: #f3f4f6; }
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 
-.app-shell { min-height: 100vh; }
+.app-shell {
+  min-height: 100vh;
+  --original-text-size: 13px;
+  --translated-text-size: 14px;
+  --transcript-line-height: 1.55;
+  --transcript-entry-gap: 20px;
+}
+.app-shell.text-size-large {
+  --original-text-size: 16px;
+  --translated-text-size: 18px;
+  --transcript-entry-gap: 24px;
+}
+.app-shell.text-size-extra-large {
+  --original-text-size: 20px;
+  --translated-text-size: 23px;
+  --transcript-line-height: 1.5;
+  --transcript-entry-gap: 28px;
+}
+.app-shell.text-size-presentation {
+  --original-text-size: 26px;
+  --translated-text-size: 32px;
+  --transcript-line-height: 1.4;
+  --transcript-entry-gap: 34px;
+}
 
 .topbar {
   height: 68px;
@@ -145,6 +168,18 @@ button { color: inherit; }
 .language-pair > button { width: 31px; height: 31px; display: grid; place-items: center; cursor: pointer; color: #737983; background: #fff; border: 1px solid #e1e4e7; border-radius: 50%; }
 .language-pair > button svg { width: 15px; }
 
+.toolbar-right { display: flex; align-items: center; gap: 10px; }
+.text-size-control { display: flex; align-items: center; gap: 4px; padding: 4px; background: #f4f5f7; border-radius: 8px; }
+.text-size-control > span { padding: 0 5px; color: #9399a2; font-size: 9px; text-transform: uppercase; font-weight: 700; }
+.text-size-control button {
+  min-width: 29px; height: 27px; padding: 0 6px; cursor: pointer;
+  color: #676d76; background: #fff; border: 1px solid #e2e4e8; border-radius: 6px;
+  font-size: 11px; font-weight: 700;
+}
+.text-size-control button:last-child { font-size: 14px; }
+.text-size-control button:disabled { opacity: .35; cursor: default; }
+.text-size-control output { min-width: 38px; color: #3d4249; text-align: center; font-size: 10px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
 .speaker-switch { display: flex; align-items: center; gap: 5px; padding: 4px; background: #f4f5f7; border-radius: 8px; }
 .speaker-switch > span { padding: 0 6px; color: #9399a2; font-size: 9px; text-transform: uppercase; font-weight: 700; }
 .speaker-switch button { padding: 6px 11px; border: 0; border-radius: 6px; cursor: pointer; color: #777d86; background: transparent; font-size: 11px; font-weight: 600; }
@@ -186,12 +221,12 @@ button { color: inherit; }
 .panel-empty svg { width: 22px; }
 .panel-empty strong { margin-top: 14px; color: #777e87; font-size: 12px; }
 .panel-empty p { margin: 5px 0; font-size: 10px; }
-.transcript-entry { padding: 0 0 20px; animation: enter .2s ease-out; }
+.transcript-entry { padding: 0 0 var(--transcript-entry-gap); animation: enter .2s ease-out; }
 @keyframes enter { from { opacity: 0; transform: translateY(4px); } }
 .transcript-entry time { display: block; margin-bottom: 7px; color: #acb1b8; font-size: 9px; font-variant-numeric: tabular-nums; }
-.transcript-entry p { margin: 0; line-height: 1.55; }
-.original-text { color: #5e646d; font-size: 13px; }
-.translated-text { margin-top: 6px !important; color: #25282e; font-size: 14px; font-weight: 700; }
+.transcript-entry p { margin: 0; line-height: var(--transcript-line-height); }
+.original-text { color: #5e646d; font-size: var(--original-text-size); }
+.translated-text { margin-top: 6px !important; color: #25282e; font-size: var(--translated-text-size); font-weight: 700; }
 .translated-text.error { color: #c65334; font-size: 12px; font-weight: 500; }
 .transcript-entry.interim { padding: 11px; background: #fff7f3; border: 1px dashed #ffbea8; border-radius: 8px; }
 .transcript-entry.interim time { color: var(--accent); font-weight: 700; }
@@ -233,6 +268,13 @@ button { color: inherit; }
 .settings-modal textarea { display: block; width: calc(100% - 42px); height: 112px; margin: 0 21px; padding: 11px 12px; resize: vertical; outline: 0; color: #3b3f45; background: #fafafa; border: 1px solid #e0e3e6; border-radius: 8px; font-size: 11px; line-height: 1.55; }
 .settings-modal textarea:focus { border-color: #ffac91; box-shadow: 0 0 0 3px rgba(255,109,61,.08); }
 .char-count { margin: 5px 23px 13px; color: #a5aab1; text-align: right; font-size: 9px; }
+.text-size-setting { margin: 0 21px; padding: 12px 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid #eceef0; }
+.text-size-setting > span { display: flex; flex-direction: column; }
+.text-size-setting strong { font-size: 11px; }
+.text-size-setting small { margin-top: 3px; color: #979ca4; font-size: 9px; }
+.text-size-setting > div { flex: 0 0 auto; display: flex; gap: 4px; }
+.text-size-setting button { padding: 6px 8px; cursor: pointer; color: #757b84; background: #f5f6f7; border: 1px solid #e3e5e8; border-radius: 6px; font-size: 9px; font-weight: 700; }
+.text-size-setting button.active { color: #fff; background: var(--accent); border-color: var(--accent); }
 .toggle-row { margin: 0 21px 18px; padding: 12px 0; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid #eceef0; }
 .toggle-row > span { display: flex; flex-direction: column; }
 .toggle-row strong { font-size: 11px; }
@@ -262,6 +304,8 @@ button { color: inherit; }
   .language-toolbar { padding: 8px 12px; height: auto; flex-basis: auto; align-items: flex-start; flex-direction: column; }
   .language-pair { width: 100%; }
   .language-pair select { min-width: 0; flex: 1; }
+  .toolbar-right { width: 100%; flex-wrap: wrap; }
+  .text-size-control { flex: 0 0 auto; }
   .speaker-switch { align-self: stretch; }
   .speaker-switch button { flex: 1; }
   .transcript-grid { grid-template-columns: 1fr; overflow-y: auto; }
@@ -277,9 +321,16 @@ button { color: inherit; }
   .language-pair label { display: none; }
   .language-pair select { font-size: 10px; }
   .speaker-switch > span { display: none; }
+  .toolbar-right { gap: 6px; }
+  .text-size-control { width: 100%; justify-content: center; }
+  .speaker-switch { width: 100%; }
   .transcript-grid { padding: 7px; gap: 7px; }
   .transcript-panel { min-height: 350px; }
   .session-footer > span:last-child { display: none; }
+  .text-size-setting { align-items: flex-start; flex-direction: column; }
+  .text-size-setting > div { width: 100%; }
+  .text-size-setting button { flex: 1; }
+  .app-shell.text-size-presentation { --original-text-size: 22px; --translated-text-size: 28px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
