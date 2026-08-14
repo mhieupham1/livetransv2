@@ -184,7 +184,7 @@ export default function App() {
   const beginRealtimeRef = useRef<() => void>(() => undefined);
   const transcribeAudioRef = useRef<(audio: Blob, durationMs: number, language: LanguageCode, sessionSecond: number) => void>(() => undefined);
   const startSegmentRef = useRef<() => void>(() => undefined);
-  const panelEndsRef = useRef<Record<string, HTMLDivElement | null>>({});
+  const panelScrollsRef = useRef<Record<string, HTMLDivElement | null>>({});
 
   const recordingSupported = Boolean(
     typeof navigator.mediaDevices !== "undefined"
@@ -210,8 +210,9 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(entries.slice(-100)));
-    panelEndsRef.current.forward?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    panelEndsRef.current.reverse?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    Object.values(panelScrollsRef.current).forEach((panel) => {
+      panel?.scrollTo({ top: panel.scrollHeight, behavior: "smooth" });
+    });
   }, [entries]);
 
   useEffect(() => {
@@ -803,6 +804,12 @@ export default function App() {
     localStorage.removeItem(STORAGE_KEY);
   };
 
+  const removeEntry = (id: string) => {
+    controllersRef.current.get(id)?.abort();
+    controllersRef.current.delete(id);
+    setEntries((current) => current.filter((entry) => entry.id !== id));
+  };
+
   const generateSummary = async () => {
     if (!entries.length) return;
     setShowSummary(true);
@@ -844,7 +851,11 @@ export default function App() {
         </button>
       </header>
 
-      <div className="transcript-scroll" aria-live="polite">
+      <div
+        className="transcript-scroll"
+        aria-live="polite"
+        ref={(node) => { panelScrollsRef.current[panelKey] = node; }}
+      >
         {panelEntries.length === 0 && !(
           (activeLanguage === from && (isSpeaking || transcriptionCount > 0))
           || realtimePartial?.language === from
@@ -856,6 +867,15 @@ export default function App() {
           </div>
         ) : panelEntries.map((entry) => (
           <article className="transcript-entry" key={entry.id}>
+            <button
+              className="delete-entry"
+              type="button"
+              onClick={() => removeEntry(entry.id)}
+              aria-label={`Xóa đoạn hội thoại lúc ${formatEntryTime(entry.sessionSecond)}`}
+              title="Xóa đoạn hội thoại này"
+            >
+              <Icon name="trash" />
+            </button>
             <time>{formatEntryTime(entry.sessionSecond)}</time>
             <p className="original-text">{entry.sourceText}</p>
             <p className={`translated-text ${entry.status}`}>
@@ -880,7 +900,6 @@ export default function App() {
             <p className="original-text">Đang nhận dạng giọng nói…</p>
           </article>
         )}
-        <div ref={(node) => { panelEndsRef.current[panelKey] = node; }} />
       </div>
 
       <form className="panel-input" onSubmit={(event) => handleSubmit(event, from)}>
@@ -914,7 +933,16 @@ export default function App() {
 
         <div className="top-actions">
           <span className={`api-pill ${apiConfigured ? "ready" : ""}`}><i />{apiConfigured ? "AI sẵn sàng" : "Chưa có API"}</span>
-          <button className="danger-action" onClick={clearConversation} disabled={!entries.length} aria-label="Xóa hội thoại" title="Xóa toàn bộ hội thoại"><Icon name="trash" /></button>
+          <button
+            className="danger-action clear-all-action"
+            onClick={clearConversation}
+            disabled={!entries.length}
+            aria-label="Xóa toàn bộ hội thoại"
+            title="Xóa toàn bộ hội thoại"
+          >
+            <Icon name="trash" />
+            <span>Xóa tất cả</span>
+          </button>
           <button onClick={() => setShowSettings(true)} aria-label="Cài đặt" title="Cài đặt"><Icon name="settings" /></button>
         </div>
       </header>
@@ -968,12 +996,6 @@ export default function App() {
               <button onClick={() => adjustTextSize(-1)} disabled={textSizeIndex === 0} aria-label="Thu nhỏ chữ">A−</button>
               <output aria-live="polite">{TEXT_SIZE_LABELS[textSize]}</output>
               <button onClick={() => adjustTextSize(1)} disabled={textSizeIndex === TEXT_SIZES.length - 1} aria-label="Phóng to chữ">A+</button>
-            </div>
-
-            <div className="speaker-switch" aria-label="Chọn người đang nói">
-              <span>Đang nghe:</span>
-              <button className={activeLanguage === source ? "active" : ""} onClick={() => switchSpeaker(source)}>{LANGUAGES[source].name}</button>
-              {mode === "two-way" && <button className={activeLanguage === target ? "active" : ""} onClick={() => switchSpeaker(target)}>{LANGUAGES[target].name}</button>}
             </div>
           </div>
         </section>
