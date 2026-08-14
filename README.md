@@ -4,7 +4,7 @@
 
 ## Tính năng
 
-- Ghi WebM/Opus trong trình duyệt, truyền audio theo WebSocket và hiển thị transcript tạm thời bằng Soniox realtime.
+- Ghi WebM/Opus trong trình duyệt, truyền audio theo WebSocket và hiển thị transcript tạm thời bằng dịch vụ STT realtime.
 - Tự chia lượt nói theo khoảng lặng, nhận diện ngôn ngữ và chuyển câu vào đúng khung Việt, Anh hoặc Nhật.
 - Tự động dùng lại endpoint HTTP transcription nếu kết nối realtime bị lỗi hoặc timeout.
 - Dịch streaming qua API tương thích OpenAI.

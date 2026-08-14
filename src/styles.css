@@ -20,7 +20,28 @@
 html, body, #root { min-width: 320px; min-height: 100%; }
 body { margin: 0; min-height: 100vh; background: #f3f4f6; }
 button, input, select, textarea { font: inherit; }
-button { color: inherit; }
+button {
+  color: inherit;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.app-shell svg {
+  display: block;
+  height: auto;
+  flex: 0 0 auto;
+  pointer-events: none;
+}
+.top-actions > button,
+.control-button,
+.session-tools button,
+.language-pair > button,
+.panel-audio,
+.delete-entry,
+.panel-input button,
+.modal-card > header button {
+  padding: 0;
+  line-height: 0;
+}
 
 .app-shell {
   min-height: 100vh;

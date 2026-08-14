@@ -17,6 +17,41 @@ const languages = {
 
 type LanguageCode = keyof typeof languages;
 
+function waitForRetry(delayMs: number, signal: AbortSignal) {
+  return new Promise<void>((resolveWait, rejectWait) => {
+    if (signal.aborted) {
+      rejectWait(new Error("Request aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abortWait);
+      resolveWait();
+    }, delayMs);
+    const abortWait = () => {
+      clearTimeout(timer);
+      rejectWait(new Error("Request aborted"));
+    };
+    signal.addEventListener("abort", abortWait, { once: true });
+  });
+}
+
+async function fetchWithRateLimitRetry(url: string, init: RequestInit, signal: AbortSignal) {
+  const maxRetries = 3;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const upstream = await fetch(url, { ...init, signal });
+    if (upstream.status !== 429 || attempt === maxRetries) return upstream;
+
+    const retryAfter = upstream.headers.get("retry-after");
+    const retryAfterSeconds = retryAfter ? Number(retryAfter) : Number.NaN;
+    const delayMs = Number.isFinite(retryAfterSeconds)
+      ? Math.max(250, retryAfterSeconds * 1_000)
+      : 1_000 * (2 ** attempt);
+    await upstream.body?.cancel().catch(() => undefined);
+    await waitForRetry(Math.min(delayMs, 10_000), signal);
+  }
+  throw new Error("Không thể gọi lại dịch vụ dịch.");
+}
+
 function realtimeError(message: string) {
   return JSON.stringify({
     type: "error",
@@ -28,13 +63,20 @@ function sanitizeRealtimeSession(rawData: RawData) {
   const event = JSON.parse(rawData.toString()) as {
     type?: unknown;
     session?: {
-      audio?: { input?: { transcription?: { languages?: unknown; prompt?: unknown; keywords?: unknown } } };
+      audio?: {
+        input?: {
+          format?: { type?: unknown; rate?: unknown };
+          transcription?: { languages?: unknown; prompt?: unknown; keywords?: unknown };
+        };
+      };
     };
   };
   if (event.type !== "session.update" || !event.session || typeof event.session !== "object") {
     throw new Error("Sự kiện đầu tiên phải là session.update.");
   }
   const transcription = event.session.audio?.input?.transcription;
+  const requestedFormat = event.session.audio?.input?.format;
+  const isPcm = requestedFormat?.type === "audio/pcm";
   const requestedLanguages = Array.isArray(transcription?.languages) ? transcription.languages : [];
   const languageHints = requestedLanguages
     .map((value) => String(value).trim().toLowerCase().split(/[-_]/, 1)[0])
@@ -50,7 +92,9 @@ function sanitizeRealtimeSession(rawData: RawData) {
       type: "transcription",
       audio: {
         input: {
-          format: { type: "audio/webm" },
+          format: isPcm
+            ? { type: "audio/pcm", rate: 24_000 }
+            : { type: "audio/webm" },
           transcription: {
             model: "soniox-stt",
             ...(languageHints.length ? { languages: languageHints } : {}),
@@ -224,7 +268,7 @@ app.post("/api/translate", async (request, response) => {
   });
 
   try {
-    const upstream = await fetch(`${baseUrl}/v1/chat/completions`, {
+    const upstream = await fetchWithRateLimitRetry(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -250,10 +294,9 @@ app.post("/api/translate", async (request, response) => {
           { role: "user", content: text },
         ],
         temperature: 0.1,
-        stream: true,
+        stream: false,
       }),
-      signal: controller.signal,
-    });
+    }, controller.signal);
 
     if (!upstream.ok) {
       const upstreamMessage = await upstream.text();
@@ -264,51 +307,15 @@ app.post("/api/translate", async (request, response) => {
       return;
     }
 
-    response.status(200);
-    response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    response.setHeader("Cache-Control", "no-cache, no-transform");
-    response.setHeader("Connection", "keep-alive");
-    response.flushHeaders();
-
-    if (!upstream.body) {
-      response.write(`data: ${JSON.stringify({ error: "Dịch vụ không trả về dữ liệu." })}\n\n`);
-      response.end();
+    const result = await upstream.json() as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const translation = result.choices?.[0]?.message?.content?.trim() || "";
+    if (!translation) {
+      response.status(502).json({ error: "Mô hình không trả về bản dịch." });
       return;
     }
-
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line.startsWith("data:")) continue;
-
-        const data = line.slice(5).trim();
-        if (!data || data === "[DONE]") continue;
-
-        try {
-          const parsed = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>;
-          };
-          const delta = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.message?.content;
-          if (delta) response.write(`data: ${JSON.stringify({ delta })}\n\n`);
-        } catch {
-          // Bỏ qua các event metadata không phải JSON của chuẩn OpenAI.
-        }
-      }
-    }
-
-    response.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    response.end();
+    response.json({ translation });
   } catch (error) {
     if (controller.signal.aborted) {
       if (!response.writableEnded) response.end();
@@ -316,14 +323,9 @@ app.post("/api/translate", async (request, response) => {
     }
 
     console.error("Translation request failed:", error);
-    if (!response.headersSent) {
-      response.status(502).json({
-        error: "Không kết nối được tới dịch vụ dịch. Hãy kiểm tra LLM_BASE_URL.",
-      });
-    } else {
-      response.write(`data: ${JSON.stringify({ error: "Mất kết nối tới dịch vụ dịch." })}\n\n`);
-      response.end();
-    }
+    response.status(502).json({
+      error: "Không kết nối được tới dịch vụ dịch. Hãy kiểm tra LLM_BASE_URL.",
+    });
   }
 });
 
@@ -471,7 +473,7 @@ realtimeServer.on("connection", (client) => {
   if (!apiKey || model !== "soniox-stt") {
     client.send(realtimeError(!apiKey
       ? "Backend chưa được cấu hình API key."
-      : "Realtime transcription hiện chỉ hỗ trợ TRANSCRIPTION_MODEL=soniox-stt."));
+      : "Backend chưa được cấu hình đúng model STT realtime."));
     client.close(1011, "realtime transcription unavailable");
     return;
   }
@@ -535,7 +537,7 @@ realtimeServer.on("connection", (client) => {
   });
   upstream.on("error", (error) => {
     console.error("Realtime transcription upstream error:", error.message);
-    if (client.readyState === WebSocket.OPEN) client.send(realtimeError("Không kết nối được tới Soniox realtime."));
+    if (client.readyState === WebSocket.OPEN) client.send(realtimeError("Không kết nối được tới dịch vụ STT realtime."));
     closeBoth();
   });
   upstream.on("close", () => closeBoth());

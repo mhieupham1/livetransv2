@@ -37,6 +37,15 @@ const LANGUAGES: Record<LanguageCode, { name: string; short: string; speechCode:
 const STORAGE_KEY = "relay-translation-session-v2";
 const TEXT_SIZE_STORAGE_KEY = "relay-transcript-text-size-v1";
 const SILENCE_COMMIT_MS = 1_200;
+const MIN_TRANSLATION_INTERVAL_MS = 700;
+const PCM_SAMPLE_RATE = 24_000;
+const PCM_PRE_ROLL_CHUNKS = 6;
+const WEBM_MIME_TYPES = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+  "video/webm;codecs=opus",
+  "video/webm",
+] as const;
 const TEXT_SIZES: TextSize[] = ["normal", "large", "extra-large", "presentation"];
 const TEXT_SIZE_LABELS: Record<TextSize, string> = {
   normal: "100%",
@@ -120,6 +129,29 @@ function cleanRealtimeTranscript(value: string) {
   return value.replace(/<end>/gi, "").trim();
 }
 
+function supportedWebmMimeType() {
+  if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") return null;
+  return WEBM_MIME_TYPES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || null;
+}
+
+function encodePcm16Base64(samples: Float32Array, inputSampleRate: number) {
+  const outputLength = Math.max(1, Math.round(samples.length * PCM_SAMPLE_RATE / inputSampleRate));
+  const bytes = new Uint8Array(outputLength * 2);
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourcePosition = index * inputSampleRate / PCM_SAMPLE_RATE;
+    const leftIndex = Math.min(samples.length - 1, Math.floor(sourcePosition));
+    const rightIndex = Math.min(samples.length - 1, leftIndex + 1);
+    const fraction = sourcePosition - leftIndex;
+    const sample = Math.max(-1, Math.min(1, samples[leftIndex] * (1 - fraction) + samples[rightIndex] * fraction));
+    const pcm = sample < 0 ? Math.round(sample * 0x8000) : Math.round(sample * 0x7fff);
+    bytes[index * 2] = pcm & 0xff;
+    bytes[index * 2 + 1] = (pcm >> 8) & 0xff;
+  }
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 function loadHistory(): ConversationEntry[] {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
@@ -163,6 +195,11 @@ export default function App() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const pcmProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const pcmSinkRef = useRef<GainNode | null>(null);
+  const pcmPreRollRef = useRef<string[]>([]);
+  const pcmSegmentSenderRef = useRef<((audio: string) => void) | null>(null);
+  const finishPcmSegmentRef = useRef<(transcribe: boolean) => void>(() => undefined);
   const vadFrameRef = useRef<number | null>(null);
   const captureActiveRef = useRef(false);
   const chunksRef = useRef<Blob[]>([]);
@@ -179,6 +216,8 @@ export default function App() {
   const elapsedBeforePauseRef = useRef(0);
   const controllersRef = useRef(new Map<string, AbortController>());
   const conversationEpochRef = useRef(0);
+  const translationQueueRef = useRef(Promise.resolve());
+  const lastTranslationStartedAtRef = useRef(0);
   const realtimeSocketsRef = useRef(new Set<WebSocket>());
   const activeRealtimeSegmentRef = useRef("");
   const beginRealtimeRef = useRef<() => void>(() => undefined);
@@ -188,15 +227,12 @@ export default function App() {
 
   const recordingSupported = Boolean(
     typeof navigator.mediaDevices !== "undefined"
-    && typeof MediaRecorder !== "undefined"
-    && (MediaRecorder.isTypeSupported("audio/webm;codecs=opus") || MediaRecorder.isTypeSupported("audio/webm")),
+    && (supportedWebmMimeType() || typeof AudioContext !== "undefined"),
   );
   const forwardEntries = useMemo(() => entries.filter((entry) => entry.source === source), [entries, source]);
   const reverseEntries = useMemo(() => entries.filter((entry) => entry.source === target), [entries, target]);
   const textSizeIndex = TEXT_SIZES.indexOf(textSize);
-  const transcriptionProvider = transcriptionModel === "soniox-stt"
-    ? "Soniox"
-    : transcriptionModel === "grok-stt" ? "Grok" : "Whisper";
+  const transcriptionProvider = "STT";
 
   useEffect(() => {
     fetch("/api/health")
@@ -250,7 +286,7 @@ export default function App() {
     window.speechSynthesis.speak(utterance);
   }, [voiceEnabled]);
 
-  const streamTranslation = useCallback(async (entry: ConversationEntry) => {
+  const translateEntry = useCallback(async (entry: ConversationEntry) => {
     const controller = new AbortController();
     controllersRef.current.set(entry.id, controller);
 
@@ -267,42 +303,12 @@ export default function App() {
         signal: controller.signal,
       });
 
-      if (!response.ok) {
-        const body = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error || `Không thể dịch (HTTP ${response.status}).`);
-      }
-      if (!response.body) throw new Error("Dịch vụ không trả về dữ liệu.");
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let translated = "";
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split("\n\n");
-        buffer = events.pop() || "";
-
-        for (const event of events) {
-          const dataLine = event.split("\n").find((line) => line.startsWith("data:"));
-          if (!dataLine) continue;
-          try {
-            const payload = JSON.parse(dataLine.slice(5).trim()) as { delta?: string; error?: string };
-            if (payload.error) throw new Error(payload.error);
-            if (payload.delta) {
-              translated += payload.delta;
-              updateEntry(entry.id, { translation: translated });
-            }
-          } catch (error) {
-            if (error instanceof SyntaxError) continue;
-            throw error;
-          }
-        }
-      }
-
-      const finalText = translated.trim();
+      const body = (await response.json().catch(() => null)) as {
+        translation?: string;
+        error?: string;
+      } | null;
+      if (!response.ok) throw new Error(body?.error || `Không thể dịch (HTTP ${response.status}).`);
+      const finalText = body?.translation?.trim() || "";
       if (!finalText) throw new Error("Mô hình không trả về bản dịch.");
       updateEntry(entry.id, { translation: finalText, status: "done" });
       speakTranslation(finalText, entry.target);
@@ -315,6 +321,23 @@ export default function App() {
       controllersRef.current.delete(entry.id);
     }
   }, [context, speakTranslation, updateEntry]);
+
+  const enqueueTranslation = useCallback((entry: ConversationEntry) => {
+    const conversationEpoch = conversationEpochRef.current;
+    translationQueueRef.current = translationQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (conversationEpoch !== conversationEpochRef.current) return;
+        const waitMs = Math.max(
+          0,
+          MIN_TRANSLATION_INTERVAL_MS - (Date.now() - lastTranslationStartedAtRef.current),
+        );
+        if (waitMs) await new Promise((resolve) => window.setTimeout(resolve, waitMs));
+        if (conversationEpoch !== conversationEpochRef.current) return;
+        lastTranslationStartedAtRef.current = Date.now();
+        await translateEntry(entry);
+      });
+  }, [translateEntry]);
 
   const submitText = useCallback((rawText: string, fromLanguage = activeLanguage, atSecond = elapsedRef.current) => {
     const text = cleanRealtimeTranscript(rawText);
@@ -333,8 +356,8 @@ export default function App() {
     setEntries((current) => [...current, entry]);
     setManualText((current) => ({ ...current, [fromLanguage]: "" }));
     setNotice(null);
-    void streamTranslation(entry);
-  }, [activeLanguage, source, streamTranslation, target]);
+    enqueueTranslation(entry);
+  }, [activeLanguage, enqueueTranslation, source, target]);
 
   useEffect(() => {
     activeLanguageRef.current = activeLanguage;
@@ -414,12 +437,160 @@ export default function App() {
     };
   }, [transcribeAudio]);
 
+  const beginPcmSegment = useCallback(() => {
+    if (!captureActiveRef.current || pcmSegmentSenderRef.current) return;
+    if (transcriptionModel !== "soniox-stt") {
+      setNotice("Chế độ ghi âm PCM cần dịch vụ STT realtime.");
+      return;
+    }
+
+    const segmentId = makeId();
+    const segmentLanguage = activeLanguageRef.current;
+    const sessionSecond = elapsedRef.current;
+    const conversationEpoch = conversationEpochRef.current;
+    const languageHints = [segmentLanguage, source, target, ...Object.keys(LANGUAGES) as LanguageCode[]]
+      .filter((language, index, values) => values.indexOf(language) === index);
+    const socket = new WebSocket(realtimeWebSocketUrl());
+    const pendingAudio = [...pcmPreRollRef.current];
+    let socketOpened = false;
+    let committed = false;
+    let commitWhenOpen = false;
+    let finished = false;
+    let counted = false;
+    let completionTimer: number | null = null;
+
+    const cleanup = (errorMessage?: string) => {
+      if (finished) return;
+      finished = true;
+      if (completionTimer !== null) window.clearTimeout(completionTimer);
+      if (pcmSegmentSenderRef.current === sendAudio) pcmSegmentSenderRef.current = null;
+      realtimeSocketsRef.current.delete(socket);
+      setRealtimePartial((current) => current?.segmentId === segmentId ? null : current);
+      if (counted) {
+        counted = false;
+        setTranscriptionCount((count) => Math.max(0, count - 1));
+      }
+      if (errorMessage) setNotice(errorMessage);
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
+    };
+    const flushAudio = () => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      for (const audio of pendingAudio.splice(0)) {
+        socket.send(JSON.stringify({ type: "input_audio_buffer.append", audio }));
+      }
+    };
+    const sendCommit = () => {
+      if (socket.readyState !== WebSocket.OPEN || finished) return;
+      flushAudio();
+      socket.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      completionTimer = window.setTimeout(() => {
+        cleanup("Dịch vụ STT không trả về kết quả PCM kịp thời.");
+      }, 25_000);
+    };
+    const sendAudio = (audio: string) => {
+      if (finished || committed) return;
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "input_audio_buffer.append", audio }));
+      } else if (socket.readyState === WebSocket.CONNECTING) {
+        pendingAudio.push(audio);
+      }
+    };
+
+    pcmSegmentSenderRef.current = sendAudio;
+    activeRealtimeSegmentRef.current = segmentId;
+    setRealtimePartial(null);
+    realtimeSocketsRef.current.add(socket);
+    finishPcmSegmentRef.current = (transcribe) => {
+      const isCurrentSegment = pcmSegmentSenderRef.current === sendAudio;
+      if (isCurrentSegment) pcmSegmentSenderRef.current = null;
+      speechDetectedRef.current = false;
+      setIsSpeaking(false);
+      if (!isCurrentSegment || finished) return;
+      if (!transcribe) {
+        cleanup();
+        return;
+      }
+      committed = true;
+      counted = true;
+      setTranscriptionCount((count) => count + 1);
+      if (socket.readyState === WebSocket.OPEN) sendCommit();
+      else commitWhenOpen = true;
+    };
+
+    socket.onopen = () => {
+      socketOpened = true;
+      socket.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          type: "transcription",
+          audio: {
+            input: {
+              format: { type: "audio/pcm", rate: PCM_SAMPLE_RATE },
+              transcription: {
+                model: "soniox-stt",
+                languages: languageHints,
+                ...(context.trim() ? { prompt: context.trim() } : {}),
+              },
+            },
+          },
+        },
+      }));
+      flushAudio();
+      if (commitWhenOpen) sendCommit();
+    };
+    socket.onmessage = (message) => {
+      try {
+        const event = JSON.parse(String(message.data)) as {
+          type?: string;
+          transcript?: string;
+          tokens?: Array<{ language?: string }>;
+          languages?: Array<{ code?: string } | string>;
+          error?: { message?: string };
+        };
+        if (event.type === "transcription.partial") {
+          if (activeRealtimeSegmentRef.current !== segmentId) return;
+          const tokenLanguage = event.tokens
+            ?.map((token) => normalizeDetectedLanguage(token.language || ""))
+            .reverse()
+            .find((language): language is LanguageCode => Boolean(language));
+          setRealtimePartial({
+            segmentId,
+            text: cleanRealtimeTranscript(event.transcript || ""),
+            language: tokenLanguage && (tokenLanguage === source || tokenLanguage === target)
+              ? tokenLanguage
+              : segmentLanguage,
+          });
+        } else if (event.type === "conversation.item.input_audio_transcription.completed") {
+          const transcript = cleanRealtimeTranscript(event.transcript || "");
+          const detectedLanguages = (event.languages || []).map((language) => (
+            typeof language === "string" ? language : language.code || ""
+          ));
+          if (transcript && conversationEpoch === conversationEpochRef.current) {
+            routeTranscription(transcript, detectedLanguages, segmentLanguage, sessionSecond);
+          }
+          cleanup();
+        } else if (event.type === "error") {
+          cleanup(event.error?.message || "Dịch vụ STT realtime trả về lỗi.");
+        }
+      } catch {
+        cleanup("Dịch vụ STT realtime trả về dữ liệu không hợp lệ.");
+      }
+    };
+    socket.onerror = () => cleanup("Không kết nối được tới dịch vụ STT realtime.");
+    socket.onclose = () => {
+      realtimeSocketsRef.current.delete(socket);
+      if (!finished) cleanup(socketOpened && committed ? "Kết nối STT realtime đã đóng trước khi có kết quả." : undefined);
+    };
+  }, [context, routeTranscription, source, target, transcriptionModel]);
+
   const startSegment = useCallback(() => {
     const stream = mediaStreamRef.current;
     if (!stream || !captureActiveRef.current) return;
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-      ? "audio/webm;codecs=opus"
-      : "audio/webm";
+    const mimeType = supportedWebmMimeType();
+    if (!mimeType) {
+      setNotice("Safari trên iPhone này chưa hỗ trợ ghi âm WebM/Opus. Hãy cập nhật iOS lên phiên bản mới hơn.");
+      return;
+    }
     const recorder = new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 32_000 });
     const segmentId = makeId();
     const segmentChunks: Blob[] = [];
@@ -516,16 +687,16 @@ export default function App() {
             ));
             settle({ transcript: cleanRealtimeTranscript(event.transcript || ""), languages: detectedLanguages });
           } else if (event.type === "error") {
-            socketFailure = event.error?.message || "Soniox realtime trả về lỗi.";
+            socketFailure = event.error?.message || "Dịch vụ STT realtime trả về lỗi.";
             settle(null);
           }
         } catch {
-          socketFailure = "Soniox realtime trả về dữ liệu không hợp lệ.";
+          socketFailure = "Dịch vụ STT realtime trả về dữ liệu không hợp lệ.";
           settle(null);
         }
       };
       realtimeSocket.onerror = () => {
-        socketFailure = "Không kết nối được tới Soniox realtime.";
+        socketFailure = "Không kết nối được tới dịch vụ STT realtime.";
         settleReady(false);
         settle(null);
       };
@@ -554,7 +725,7 @@ export default function App() {
       if (!event.data.size) return;
       segmentChunks.push(event.data);
       if (!speechDetectedRef.current) {
-        // Giữ header WebM và khoảng 2 giây pre-roll, không gửi thời gian im lặng dài lên Soniox.
+        // Giữ header WebM và khoảng 2 giây pre-roll, không gửi thời gian im lặng dài lên dịch vụ STT.
         if (segmentChunks.length > 9) segmentChunks.splice(1, segmentChunks.length - 9);
         return;
       }
@@ -624,10 +795,16 @@ export default function App() {
 
   const finishSegment = useCallback((transcribe: boolean) => {
     const recorder = mediaRecorderRef.current;
-    if (!recorder || recorder.state !== "recording") return;
-    shouldTranscribeRef.current = transcribe && speechDetectedRef.current;
+    if (recorder?.state === "recording") {
+      shouldTranscribeRef.current = transcribe && speechDetectedRef.current;
+      setIsSpeaking(false);
+      recorder.stop();
+      return;
+    }
+    const shouldTranscribe = transcribe && speechDetectedRef.current;
+    speechDetectedRef.current = false;
     setIsSpeaking(false);
-    recorder.stop();
+    finishPcmSegmentRef.current(shouldTranscribe);
   }, []);
 
   const stopAudioCapture = useCallback((transcribePending = true) => {
@@ -638,7 +815,15 @@ export default function App() {
     if (recorder?.state === "recording") {
       shouldTranscribeRef.current = transcribePending && speechDetectedRef.current;
       recorder.stop();
+    } else if (speechDetectedRef.current || pcmSegmentSenderRef.current) {
+      finishPcmSegmentRef.current(transcribePending && speechDetectedRef.current);
     }
+    pcmProcessorRef.current?.disconnect();
+    if (pcmProcessorRef.current) pcmProcessorRef.current.onaudioprocess = null;
+    pcmProcessorRef.current = null;
+    pcmSinkRef.current?.disconnect();
+    pcmSinkRef.current = null;
+    pcmPreRollRef.current = [];
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
     void audioContextRef.current?.close();
@@ -649,9 +834,7 @@ export default function App() {
   }, []);
 
   const startAudioCapture = useCallback(async () => {
-    if (!recordingSupported) {
-      throw new Error("Trình duyệt chưa hỗ trợ ghi âm WebM/Opus. Bạn vẫn có thể nhập nội dung.");
-    }
+    if (!recordingSupported) throw new Error("Trình duyệt chưa hỗ trợ truy cập và xử lý âm thanh từ micro.");
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -662,12 +845,32 @@ export default function App() {
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0.35;
     sourceNode.connect(analyser);
+    await audioContext.resume();
 
     mediaStreamRef.current = stream;
     audioContextRef.current = audioContext;
     captureActiveRef.current = true;
     setIsListening(true);
-    startSegmentRef.current();
+    if (supportedWebmMimeType()) {
+      startSegmentRef.current();
+    } else {
+      const processor = audioContext.createScriptProcessor(4_096, 1, 1);
+      const sink = audioContext.createGain();
+      sink.gain.value = 0;
+      processor.onaudioprocess = (event) => {
+        if (!captureActiveRef.current) return;
+        const audio = encodePcm16Base64(event.inputBuffer.getChannelData(0), audioContext.sampleRate);
+        pcmPreRollRef.current.push(audio);
+        if (pcmPreRollRef.current.length > PCM_PRE_ROLL_CHUNKS) pcmPreRollRef.current.shift();
+        if (speechDetectedRef.current) pcmSegmentSenderRef.current?.(audio);
+      };
+      sourceNode.connect(processor);
+      processor.connect(sink);
+      sink.connect(audioContext.destination);
+      pcmProcessorRef.current = processor;
+      pcmSinkRef.current = sink;
+      beginRealtimeRef.current = beginPcmSegment;
+    }
 
     const samples = new Float32Array(analyser.fftSize);
     const monitorVoice = () => {
@@ -694,7 +897,7 @@ export default function App() {
       vadFrameRef.current = requestAnimationFrame(monitorVoice);
     };
     vadFrameRef.current = requestAnimationFrame(monitorVoice);
-  }, [finishSegment, recordingSupported]);
+  }, [beginPcmSegment, finishSegment, recordingSupported]);
 
   useEffect(() => () => {
     controllersRef.current.forEach((controller) => controller.abort());
@@ -731,10 +934,12 @@ export default function App() {
   };
 
   const stopSession = () => {
-    elapsedBeforePauseRef.current = elapsed;
     startedAtRef.current = null;
     setSessionStatus("idle");
     stopAudioCapture(true);
+    elapsedBeforePauseRef.current = 0;
+    elapsedRef.current = 0;
+    setElapsed(0);
   };
 
   const switchSpeaker = (language: LanguageCode) => {
@@ -791,6 +996,8 @@ export default function App() {
     if (!entries.length) return;
     if (!window.confirm("Xóa toàn bộ nội dung hội thoại? Hành động này không thể hoàn tác.")) return;
     conversationEpochRef.current += 1;
+    translationQueueRef.current = Promise.resolve();
+    lastTranslationStartedAtRef.current = 0;
     controllersRef.current.forEach((controller) => controller.abort());
     controllersRef.current.clear();
     realtimeSocketsRef.current.forEach((socket) => socket.close());
@@ -951,7 +1158,7 @@ export default function App() {
         <section className="session-controls">
           <div className="audio-source">
             <span className={`source-icon ${isListening ? "live" : ""}`}><Icon name="mic" /></span>
-            <div><small>Nguồn âm thanh</small><strong>Microphone · {transcriptionProvider}</strong></div>
+            <div><small>Nguồn âm thanh</small><strong>Microphone</strong></div>
           </div>
 
           <div className="transport">
@@ -1015,7 +1222,7 @@ export default function App() {
                 ? `${isSpeaking ? "Đang ghi âm" : "Đang chờ giọng nói"} · ${LANGUAGES[activeLanguage].name}`
                 : "Sẵn sàng bắt đầu"
           }</span>
-          <span>WebM/Opus · {transcriptionProvider} STT · AI translation</span>
+          <span>WebM/Opus · STT · AI translation</span>
         </footer>
       </main>
 

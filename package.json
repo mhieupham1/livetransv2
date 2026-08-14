@@ -7,6 +7,7 @@
     "dev": "concurrently -k -n WEB,API -c cyan,magenta \"vite\" \"tsx watch server/index.ts\"",
     "build": "tsc -b && vite build",
     "start": "tsx server/index.ts",
+    "public": "npm run build && concurrently -k -n APP,TUNNEL -c cyan,magenta \"npm start\" \"cloudflared tunnel --url http://localhost:3001 --no-autoupdate\"",
     "check": "tsc -b --pretty false"
   },
   "dependencies": {
