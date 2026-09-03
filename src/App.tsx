@@ -1286,6 +1286,54 @@ export default function App() {
       </header>
 
       <main className="session-shell">
+        <header className="desktop-workspace-header">
+          <div className="desktop-brand">
+            <span className="brand-mark"><Icon name="spark" /></span>
+            <strong>Relay</strong>
+          </div>
+
+          <nav className="desktop-mode-tabs" aria-label="Chế độ phiên dịch">
+            <button className={mode === "one-way" ? "active" : ""} onClick={() => { setMode("one-way"); switchSpeaker(source); }}>Một chiều</button>
+            <button className={mode === "two-way" ? "active" : ""} onClick={() => setMode("two-way")}>Hai chiều</button>
+          </nav>
+
+          <div className="desktop-language-pair">
+            <select aria-label="Ngôn ngữ nguồn" value={source} onChange={(event) => changeSource(event.target.value as LanguageCode)}>
+              {(Object.keys(LANGUAGES) as LanguageCode[]).map((code) => <option key={code} value={code}>{LANGUAGES[code].name}</option>)}
+            </select>
+            <button onClick={swapLanguages} aria-label="Đổi ngôn ngữ"><Icon name="swap" /></button>
+            <select aria-label="Ngôn ngữ đích" value={target} onChange={(event) => changeTarget(event.target.value as LanguageCode)}>
+              {(Object.keys(LANGUAGES) as LanguageCode[]).map((code) => <option key={code} value={code}>{LANGUAGES[code].name}</option>)}
+            </select>
+          </div>
+
+          <div className="desktop-transport">
+            {sessionStatus === "running" ? (
+              <button className="desktop-control primary" onClick={pauseSession} aria-label="Tạm dừng"><Icon name="pause" /></button>
+            ) : (
+              <button
+                className="desktop-control primary"
+                onClick={() => void startSession()}
+                aria-label={sessionStatus === "paused" ? "Tiếp tục ghi âm" : "Bắt đầu ghi âm"}
+                title={sessionStatus === "paused" ? "Tiếp tục ghi âm" : "Bắt đầu ghi âm"}
+              >
+                <Icon name={sessionStatus === "paused" ? "play" : "mic"} />
+              </button>
+            )}
+            <button className="desktop-control" onClick={stopSession} disabled={sessionStatus === "idle" && elapsed === 0} aria-label="Kết thúc"><Icon name="stop" /></button>
+          </div>
+
+          <time className="desktop-time">{formatTime(elapsed)}</time>
+
+          <div className="desktop-actions">
+            <button className={voiceEnabled ? "active" : ""} onClick={() => setVoiceEnabled((value) => !value)} aria-label="Phát giọng dịch" title="Phát giọng dịch"><Icon name={voiceEnabled ? "volume" : "volumeOff"} /></button>
+            <button onClick={exportTranscript} disabled={!entries.length} aria-label="Tải transcript" title="Tải transcript"><Icon name="download" /></button>
+            <button onClick={() => void generateSummary()} disabled={!entries.length} aria-label="Biên bản AI" title="Biên bản AI"><Icon name="notes" /></button>
+            <button className="danger-action" onClick={clearConversation} disabled={!entries.length} aria-label="Xóa toàn bộ hội thoại" title="Xóa toàn bộ hội thoại"><Icon name="trash" /></button>
+            <button onClick={() => setShowSettings(true)} aria-label="Cài đặt" title="Cài đặt"><Icon name="settings" /></button>
+          </div>
+        </header>
+
         <section className="session-controls">
           <div className="audio-source">
             <span className={`source-icon ${isListening ? "live" : ""}`}><Icon name="mic" /></span>

@@ -119,9 +119,9 @@ button {
 .api-pill.ready i { background: #2bbb83; box-shadow: 0 0 0 3px rgba(43,187,131,.12); }
 
 .session-shell {
-  max-width: 1480px;
+  max-width: none;
   height: calc(100vh - 92px);
-  min-height: 670px;
+  min-height: 0;
   margin: 12px auto;
   display: flex; flex-direction: column;
   overflow: hidden;
@@ -178,6 +178,7 @@ button {
 .session-tools button:disabled { opacity: .35; cursor: default; }
 .session-tools svg { width: 17px; }
 
+.desktop-workspace-header,
 .mobile-collapse-action,
 .mobile-compact-header { display: none; }
 
@@ -223,7 +224,7 @@ button {
   display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
   background: #f3f4f6;
 }
-.transcript-grid.one-way { grid-template-columns: minmax(0, 920px); justify-content: center; }
+.transcript-grid.one-way { grid-template-columns: minmax(0, 1fr); }
 .transcript-panel {
   min-width: 0; min-height: 0; display: flex; flex-direction: column;
   background: #fff; border: 1px solid #e0e3e6; border-radius: 10px; overflow: hidden;
@@ -335,6 +336,76 @@ button {
 .summary-loader { width: 28px; height: 28px; border: 3px solid #e5eaff; border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .summary-content pre { margin: 0; white-space: pre-wrap; color: #3e434a; font: 12px/1.65 "DM Sans", sans-serif; }
+
+@media (min-width: 901px) {
+  .app-shell { height: 100vh; min-height: 0; overflow: hidden; }
+  .topbar,
+  .session-controls,
+  .language-toolbar,
+  .session-footer { display: none; }
+  .session-shell {
+    height: calc(100vh - 16px); margin: 8px;
+    border-radius: 12px;
+  }
+  .desktop-workspace-header {
+    min-height: 58px; flex: 0 0 58px; padding: 0 12px;
+    display: grid; grid-template-columns: auto auto minmax(240px, 1fr) auto auto auto;
+    align-items: center; gap: 8px;
+    background: #fff; border-bottom: 1px solid var(--line);
+  }
+  .desktop-brand { display: flex; align-items: center; gap: 8px; }
+  .desktop-brand .brand-mark { width: 34px; height: 34px; border-radius: 9px; }
+  .desktop-brand .brand-mark svg { width: 19px; }
+  .desktop-brand strong { font: 800 16px Manrope, sans-serif; letter-spacing: -.5px; }
+  .desktop-mode-tabs {
+    height: 36px; padding: 3px; display: flex; gap: 2px;
+    background: #f3f4f6; border-radius: 8px;
+  }
+  .desktop-mode-tabs button {
+    padding: 0 11px; cursor: pointer; color: #7b818b;
+    background: transparent; border: 0; border-radius: 6px;
+    font-size: 11px; font-weight: 700; white-space: nowrap;
+  }
+  .desktop-mode-tabs button.active {
+    color: #282b31; background: #fff; box-shadow: 0 1px 4px rgba(31, 35, 41, .12);
+  }
+  .desktop-language-pair {
+    width: 100%; max-width: 420px; min-width: 0;
+    display: grid; grid-template-columns: minmax(0, 1fr) 30px minmax(0, 1fr); align-items: center; gap: 5px;
+  }
+  .desktop-language-pair select {
+    width: 100%; min-width: 0; height: 36px; padding: 0 28px 0 10px;
+    appearance: none; color: #353940; background-color: #f8f9fa;
+    border: 1px solid #e1e4e7; border-radius: 7px;
+    font-size: 12px; font-weight: 700;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%237b818b' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 8px center;
+  }
+  .desktop-language-pair > button,
+  .desktop-control,
+  .desktop-actions button {
+    width: 34px; height: 34px; padding: 0; display: grid; place-items: center;
+    cursor: pointer; color: #737983; background: #fff;
+    border: 1px solid #dfe2e6; border-radius: 8px;
+  }
+  .desktop-language-pair > button { width: 30px; height: 30px; border-radius: 50%; }
+  .desktop-language-pair svg { width: 15px; }
+  .desktop-transport { display: flex; gap: 4px; }
+  .desktop-control.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+  .desktop-control:disabled,
+  .desktop-actions button:disabled { opacity: .35; cursor: default; }
+  .desktop-control svg, .desktop-actions svg { width: 17px; }
+  .desktop-time {
+    min-width: 62px; color: #4b5058; text-align: center;
+    font: 700 12px Manrope, sans-serif; font-variant-numeric: tabular-nums;
+  }
+  .desktop-actions { display: flex; gap: 4px; }
+  .desktop-actions button.active { color: var(--accent); background: var(--accent-soft); border-color: #ffd8ca; }
+  .desktop-actions button.danger-action:not(:disabled):hover { color: #c65334; background: #fff4ef; border-color: #f2cfc3; }
+  .transcript-grid { padding: 8px; gap: 8px; }
+  .panel-header { height: 44px; flex-basis: 44px; }
+  .transcript-scroll { padding: 14px 15px 20px; }
+}
 
 @media (max-width: 900px) {
   .topbar { grid-template-columns: 1fr auto; padding: 0 16px; }
