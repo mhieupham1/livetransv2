@@ -36,6 +36,7 @@ const LANGUAGES: Record<LanguageCode, { name: string; short: string; speechCode:
 
 const STORAGE_KEY = "relay-translation-session-v2";
 const TEXT_SIZE_STORAGE_KEY = "relay-transcript-text-size-v1";
+const MOBILE_MERGED_VIEW_STORAGE_KEY = "relay-mobile-merged-view-v1";
 const SILENCE_COMMIT_MS = 1_200;
 const MIN_TRANSLATION_INTERVAL_MS = 700;
 const PCM_SAMPLE_RATE = 24_000;
@@ -72,6 +73,7 @@ const icons: Record<string, ReactNode> = {
   notes: <><path d="M6 3h12v18H6zM9 7h6M9 11h6M9 15h4" /></>,
   trash: <><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6" /></>,
   send: <><path d="m21 3-7 18-3-8-8-3Z" /><path d="m21 3-10 10" /></>,
+  keyboard: <><rect x="3" y="6" width="18" height="12" rx="2" /><path d="M7 10h.01M10.5 10h.01M14 10h.01M17.5 10h.01M7 13h.01M10.5 13h.01M14 13h.01M17.5 13h.01M8 16h8" /></>,
   close: <path d="m6 6 12 12M18 6 6 18" />,
   spark: <><path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2Z" /><path d="m18.5 14 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8Z" /></>,
   chevron: <path d="m9 18 6-6-6-6" />,
@@ -168,6 +170,10 @@ function loadTextSize(): TextSize {
   return TEXT_SIZES.includes(saved as TextSize) ? saved as TextSize : "normal";
 }
 
+function loadMobileMergedView() {
+  return localStorage.getItem(MOBILE_MERGED_VIEW_STORAGE_KEY) !== "false";
+}
+
 export default function App() {
   const [source, setSource] = useState<LanguageCode>("vi");
   const [target, setTarget] = useState<LanguageCode>("en");
@@ -182,6 +188,9 @@ export default function App() {
   const [transcriptionCount, setTranscriptionCount] = useState(0);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [textSize, setTextSize] = useState<TextSize>(loadTextSize);
+  const [mobileHeaderCollapsed, setMobileHeaderCollapsed] = useState(false);
+  const [mobileMergedView, setMobileMergedView] = useState(loadMobileMergedView);
+  const [mobileTextInputVisible, setMobileTextInputVisible] = useState(false);
   const [context, setContext] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showSummary, setShowSummary] = useState(false);
@@ -224,6 +233,7 @@ export default function App() {
   const transcribeAudioRef = useRef<(audio: Blob, durationMs: number, language: LanguageCode, sessionSecond: number) => void>(() => undefined);
   const startSegmentRef = useRef<() => void>(() => undefined);
   const panelScrollsRef = useRef<Record<string, HTMLDivElement | null>>({});
+  const mergedInputRef = useRef<HTMLInputElement | null>(null);
 
   const recordingSupported = Boolean(
     typeof navigator.mediaDevices !== "undefined"
@@ -233,6 +243,43 @@ export default function App() {
   const reverseEntries = useMemo(() => entries.filter((entry) => entry.source === target), [entries, target]);
   const textSizeIndex = TEXT_SIZES.indexOf(textSize);
   const transcriptionProvider = "STT";
+
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    let animationFrame = 0;
+
+    const syncViewportHeight = () => {
+      window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(() => {
+        const visibleHeight = viewport?.height || window.innerHeight;
+        const visibleOffsetTop = viewport?.offsetTop || 0;
+        document.documentElement.style.setProperty(
+          "--app-viewport-height",
+          `${Math.round(visibleHeight)}px`,
+        );
+        document.documentElement.style.setProperty(
+          "--app-viewport-offset-top",
+          `${Math.round(visibleOffsetTop)}px`,
+        );
+      });
+    };
+
+    syncViewportHeight();
+    viewport?.addEventListener("resize", syncViewportHeight);
+    viewport?.addEventListener("scroll", syncViewportHeight);
+    window.addEventListener("resize", syncViewportHeight);
+    window.addEventListener("orientationchange", syncViewportHeight);
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      viewport?.removeEventListener("resize", syncViewportHeight);
+      viewport?.removeEventListener("scroll", syncViewportHeight);
+      window.removeEventListener("resize", syncViewportHeight);
+      window.removeEventListener("orientationchange", syncViewportHeight);
+      document.documentElement.style.removeProperty("--app-viewport-height");
+      document.documentElement.style.removeProperty("--app-viewport-offset-top");
+    };
+  }, []);
 
   useEffect(() => {
     fetch("/api/health")
@@ -254,6 +301,16 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(TEXT_SIZE_STORAGE_KEY, textSize);
   }, [textSize]);
+
+  useEffect(() => {
+    localStorage.setItem(MOBILE_MERGED_VIEW_STORAGE_KEY, String(mobileMergedView));
+  }, [mobileMergedView]);
+
+  useEffect(() => {
+    if (!mobileTextInputVisible) return;
+    const animationFrame = window.requestAnimationFrame(() => mergedInputRef.current?.focus());
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [mobileTextInputVisible]);
 
   const adjustTextSize = (direction: -1 | 1) => {
     const nextIndex = Math.min(TEXT_SIZES.length - 1, Math.max(0, textSizeIndex + direction));
@@ -1125,8 +1182,82 @@ export default function App() {
     </section>
   );
 
+  const renderMergedPanel = () => (
+    <section className="transcript-panel merged-transcript-panel">
+      <div
+        className="transcript-scroll merged-transcript-scroll"
+        aria-live="polite"
+        ref={(node) => { panelScrollsRef.current.merged = node; }}
+      >
+        {entries.length === 0 && !realtimePartial && !isSpeaking && transcriptionCount === 0 ? (
+          <div className="panel-empty">
+            <span><Icon name="mic" /></span>
+            <strong>Chưa có nội dung</strong>
+            <p>Chọn người đang nói và bắt đầu phiên dịch.</p>
+          </div>
+        ) : entries.map((entry) => (
+          <article className="transcript-entry merged-entry" key={entry.id}>
+            <button
+              className="delete-entry"
+              type="button"
+              onClick={() => removeEntry(entry.id)}
+              aria-label={`Xóa đoạn hội thoại lúc ${formatEntryTime(entry.sessionSecond)}`}
+              title="Xóa đoạn hội thoại này"
+            >
+              <Icon name="trash" />
+            </button>
+            <p className="original-text" lang={entry.source}>{entry.sourceText}</p>
+            <p className={`translated-text ${entry.status}`} lang={entry.target}>
+              {entry.translation || <span className="typing"><i /><i /><i /></span>}
+            </p>
+          </article>
+        ))}
+
+        {realtimePartial ? (
+          <article className="transcript-entry interim realtime-partial merged-realtime-partial">
+            <time>{isSpeaking ? "TRỰC TIẾP" : "ĐANG HOÀN TẤT"}</time>
+            <p className="original-text" lang={realtimePartial.language}>{realtimePartial.text || "Đang nghe…"}</p>
+          </article>
+        ) : isSpeaking ? (
+          <article className="transcript-entry interim">
+            <time>ĐANG GHI · {LANGUAGES[activeLanguage].short}</time>
+            <p className="original-text">Đang nghe và nhận dạng trực tiếp…</p>
+          </article>
+        ) : transcriptionCount > 0 && (
+          <article className="transcript-entry transcribing">
+            <time>{transcriptionProvider.toUpperCase()}</time>
+            <p className="original-text">Đang nhận dạng giọng nói…</p>
+          </article>
+        )}
+      </div>
+
+      {mobileTextInputVisible && (
+        <form
+          className="panel-input merged-panel-input"
+          onSubmit={(event) => {
+            handleSubmit(event, activeLanguage);
+            setMobileTextInputVisible(false);
+          }}
+        >
+          <input
+            ref={mergedInputRef}
+            id="message-merged"
+            name="message-merged"
+            value={manualText[activeLanguage]}
+            onChange={(event) => setManualText((current) => ({ ...current, [activeLanguage]: event.target.value }))}
+            placeholder={`Nhập bằng ${LANGUAGES[activeLanguage].name} để thử…`}
+            maxLength={4000}
+          />
+          <button type="submit" disabled={!manualText[activeLanguage].trim()} aria-label={`Dịch từ ${LANGUAGES[activeLanguage].name}`}>
+            <Icon name="send" />
+          </button>
+        </form>
+      )}
+    </section>
+  );
+
   return (
-    <div className={`app-shell text-size-${textSize}`}>
+    <div className={`app-shell text-size-${textSize} ${mobileHeaderCollapsed ? "mobile-header-collapsed" : ""} ${mobileMergedView ? "mobile-merged-view" : ""}`}>
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark"><Icon name="spark" /></span>
@@ -1165,7 +1296,14 @@ export default function App() {
             {sessionStatus === "running" ? (
               <button className="control-button pause" onClick={pauseSession} aria-label="Tạm dừng"><Icon name="pause" /></button>
             ) : (
-              <button className="control-button play" onClick={() => void startSession()} aria-label="Bắt đầu"><Icon name="play" /></button>
+              <button
+                className="control-button play"
+                onClick={() => void startSession()}
+                aria-label={sessionStatus === "paused" ? "Tiếp tục ghi âm" : "Bắt đầu ghi âm"}
+                title={sessionStatus === "paused" ? "Tiếp tục ghi âm" : "Bắt đầu ghi âm"}
+              >
+                <Icon name={sessionStatus === "paused" ? "play" : "mic"} />
+              </button>
             )}
             <button className="control-button stop" onClick={stopSession} disabled={sessionStatus === "idle" && elapsed === 0} aria-label="Kết thúc"><Icon name="stop" /></button>
           </div>
@@ -1182,6 +1320,17 @@ export default function App() {
             <button onClick={exportTranscript} disabled={!entries.length} title="Tải transcript"><Icon name="download" /></button>
             <button onClick={() => void generateSummary()} disabled={!entries.length} title="Biên bản AI"><Icon name="notes" /></button>
           </div>
+
+          <button
+            className="mobile-collapse-action"
+            type="button"
+            onClick={() => setMobileHeaderCollapsed(true)}
+            aria-label="Thu gọn phần điều khiển"
+            aria-expanded="true"
+            title="Thu gọn phần điều khiển"
+          >
+            <Icon name="chevron" />
+          </button>
         </section>
 
         <section className="language-toolbar">
@@ -1195,6 +1344,18 @@ export default function App() {
             <select id="target-language" name="target-language" value={target} onChange={(event) => changeTarget(event.target.value as LanguageCode)}>
               {(Object.keys(LANGUAGES) as LanguageCode[]).map((code) => <option key={code} value={code}>{LANGUAGES[code].name}</option>)}
             </select>
+            {mode === "two-way" && mobileMergedView && (
+              <button
+                className={`merged-input-toggle ${mobileTextInputVisible ? "active" : ""}`}
+                type="button"
+                onClick={() => setMobileTextInputVisible((visible) => !visible)}
+                aria-label={mobileTextInputVisible ? "Ẩn ô nhập" : "Hiện ô nhập"}
+                aria-expanded={mobileTextInputVisible}
+                title={mobileTextInputVisible ? "Ẩn ô nhập" : "Nhập bằng bàn phím"}
+              >
+                <Icon name={mobileTextInputVisible ? "close" : "keyboard"} />
+              </button>
+            )}
           </div>
 
           <div className="toolbar-right">
@@ -1207,11 +1368,60 @@ export default function App() {
           </div>
         </section>
 
+        <section className="mobile-compact-header" aria-label="Điều khiển phiên dịch thu gọn">
+          <div className={`compact-language-pair ${isListening ? "live" : ""}`} title={`${LANGUAGES[source].name} sang ${LANGUAGES[target].name}`}>
+            <span>{LANGUAGES[source].short}</span>
+            <Icon name="chevron" />
+            <span>{LANGUAGES[target].short}</span>
+          </div>
+
+          <div className="compact-transport">
+            {sessionStatus === "running" ? (
+              <button className="compact-control primary" onClick={pauseSession} aria-label="Tạm dừng"><Icon name="pause" /></button>
+            ) : (
+              <button
+                className="compact-control primary"
+                onClick={() => void startSession()}
+                aria-label={sessionStatus === "paused" ? "Tiếp tục ghi âm" : "Bắt đầu ghi âm"}
+                title={sessionStatus === "paused" ? "Tiếp tục ghi âm" : "Bắt đầu ghi âm"}
+              >
+                <Icon name={sessionStatus === "paused" ? "play" : "mic"} />
+              </button>
+            )}
+            <button className="compact-control" onClick={stopSession} disabled={sessionStatus === "idle" && elapsed === 0} aria-label="Kết thúc"><Icon name="stop" /></button>
+          </div>
+
+          <time>{formatTime(elapsed)}</time>
+          {mode === "two-way" && mobileMergedView && (
+            <button
+              className={`compact-input-toggle ${mobileTextInputVisible ? "active" : ""}`}
+              type="button"
+              onClick={() => setMobileTextInputVisible((visible) => !visible)}
+              aria-label={mobileTextInputVisible ? "Ẩn ô nhập" : "Hiện ô nhập"}
+              aria-expanded={mobileTextInputVisible}
+              title={mobileTextInputVisible ? "Ẩn ô nhập" : "Nhập bằng bàn phím"}
+            >
+              <Icon name={mobileTextInputVisible ? "close" : "keyboard"} />
+            </button>
+          )}
+          <button
+            className="mobile-expand-action"
+            type="button"
+            onClick={() => setMobileHeaderCollapsed(false)}
+            aria-label="Mở rộng phần điều khiển"
+            aria-expanded="false"
+            title="Mở rộng phần điều khiển"
+          >
+            <Icon name="chevron" />
+          </button>
+        </section>
+
         {notice && <div className="notice" role="alert"><span>!</span>{notice}<button onClick={() => setNotice(null)}>×</button></div>}
 
         <div className={`transcript-grid ${mode}`}>
           {renderPanel(source, target, forwardEntries, "forward")}
           {mode === "two-way" && renderPanel(target, source, reverseEntries, "reverse")}
+          {mode === "two-way" && renderMergedPanel()}
         </div>
 
         <footer className="session-footer">
@@ -1243,6 +1453,7 @@ export default function App() {
                 ))}
               </div>
             </div>
+            <label className="toggle-row"><span><strong>Gộp hội thoại trên mobile</strong><small>Hiển thị hai chiều trong một luồng theo thời gian</small></span><input type="checkbox" checked={mobileMergedView} onChange={(event) => setMobileMergedView(event.target.checked)} /></label>
             <label className="toggle-row"><span><strong>Phát giọng bản dịch</strong><small>Đọc bản dịch sau mỗi câu hoàn chỉnh</small></span><input type="checkbox" checked={voiceEnabled} onChange={(event) => setVoiceEnabled(event.target.checked)} /></label>
             <footer><button className="primary-button" onClick={() => setShowSettings(false)}>Lưu cài đặt</button></footer>
           </section>
