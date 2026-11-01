@@ -2,9 +2,76 @@ import "dotenv/config";
 import express from "express";
 import multer from "multer";
 import { existsSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { resolve } from "node:path";
 import WebSocket, { RawData, WebSocketServer } from "ws";
+import {
+  assertSessionSecret,
+  authConfigured,
+  clearSessionCookie,
+  createSessionToken,
+  loadUserFromRequest,
+  publicGoogleClientId,
+  requireAuth,
+  requireQuota,
+  setSessionCookie,
+  verifyGoogleCredential,
+  type AuthedRequest,
+} from "./auth.ts";
+import {
+  adminConfigured,
+  authenticateAdmin,
+  clearAdminCookie,
+  createAdminToken,
+  encodePasswordHash,
+  loadAdminFromRequest,
+  requireAdmin,
+  setAdminCookie,
+  verifyPasswordHash,
+  type AdminRequest,
+} from "./adminAuth.ts";
+import {
+  applySepayPayment,
+  assertSepayAuthorized,
+  billingConfigured,
+  billingSettingsForAdmin,
+  createOrderForPlan,
+  publicOrder,
+  saveBillingSettings,
+} from "./billing.ts";
+import { rateLimit } from "./rateLimit.ts";
+import {
+  addUsedSeconds,
+  adminRevenueSummary,
+  adminStats,
+  countUsersOnPlan,
+  deactivatePlan,
+  getAdminUserById,
+  getOrderById,
+  getPlanById,
+  grantPlanToUser,
+  hasQuota,
+  creditUserSeconds,
+  ensureCurrentPeriod,
+  getUserById,
+  listOrdersForAdmin,
+  listPlans,
+  listUnmatchedPayments,
+  listUsersForAdmin,
+  markPaymentMatched,
+  refundSeconds,
+  tryConsumeSeconds,
+  upsertPlan,
+  type PlanInput,
+  publicAdminUser,
+  publicUser,
+  revokeUserSessions,
+  updateAdminPassword,
+  updateUserByAdmin,
+  upsertGoogleUser,
+  type UserPlan,
+  type UserRow,
+} from "./db.ts";
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
@@ -13,6 +80,9 @@ const languages = {
   vi: "Vietnamese",
   en: "English",
   ja: "Japanese",
+  zh: "Chinese (Mandarin)",
+  ko: "Korean",
+  th: "Thai",
 } as const;
 
 type LanguageCode = keyof typeof languages;
@@ -52,10 +122,10 @@ async function fetchWithRateLimitRetry(url: string, init: RequestInit, signal: A
   throw new Error("Không thể gọi lại dịch vụ dịch.");
 }
 
-function realtimeError(message: string) {
+function realtimeError(message: string, code = "realtime_proxy_error") {
   return JSON.stringify({
     type: "error",
-    error: { type: "server_error", code: "realtime_proxy_error", message },
+    error: { type: "server_error", code, message },
   });
 }
 
@@ -126,17 +196,147 @@ const transcriptionUpload = multer({
 app.disable("x-powered-by");
 app.use(express.json({ limit: "256kb" }));
 
+function llmConfig() {
+  return {
+    baseUrl: (process.env.LLM_BASE_URL || "http://localhost:8001").replace(/\/$/, ""),
+    apiKey: process.env.LLM_API_KEY || "",
+    model: process.env.LLM_MODEL || "gpt-5-5-mini",
+  };
+}
+
+function transcriptionConfig() {
+  const llm = llmConfig();
+  return {
+    baseUrl: (process.env.TRANSCRIPTION_BASE_URL || llm.baseUrl).replace(/\/$/, ""),
+    apiKey: process.env.TRANSCRIPTION_API_KEY || llm.apiKey,
+    model: process.env.TRANSCRIPTION_MODEL || "whisper-1",
+  };
+}
+
 app.get("/api/health", (_request, response) => {
+  const llm = llmConfig();
+  const transcription = transcriptionConfig();
   response.json({
     ok: true,
-    configured: Boolean(process.env.LLM_API_KEY),
-    model: process.env.LLM_MODEL || "gpt-5-5-mini",
-    transcriptionModel: process.env.TRANSCRIPTION_MODEL || "whisper-1",
+    configured: Boolean(llm.apiKey),
+    authRequired: true,
+    authConfigured: authConfigured(),
+    googleClientId: publicGoogleClientId() || null,
+    billingConfigured: billingConfigured(),
+    adminConfigured: adminConfigured(),
+    model: llm.model,
+    transcriptionModel: transcription.model,
   });
+});
+
+// Trần chi phí cho từng nhóm endpoint. Đặt sau requireAuth để có user id.
+const translateLimit = rateLimit({ name: "translate", capacity: 20, refillPerSecond: 1, message: "Bạn dịch quá nhanh. Chờ vài giây rồi thử lại." });
+const summarizeLimit = rateLimit({ name: "summarize", capacity: 3, refillPerSecond: 1 / 20, message: "Biên bản vừa được tạo. Chờ khoảng 20 giây để tạo lại." });
+const transcribeLimit = rateLimit({ name: "transcribe", capacity: 30, refillPerSecond: 2 });
+const orderLimit = rateLimit({ name: "order", capacity: 3, refillPerSecond: 1 / 60, message: "Bạn đã tạo nhiều đơn. Chờ một phút rồi thử lại." });
+
+app.post("/api/auth/google", async (request, response) => {
+  try {
+    const body = request.body as { credential?: unknown };
+    const credential = typeof body.credential === "string" ? body.credential.trim() : "";
+    if (!credential) {
+      response.status(400).json({ error: "Thiếu credential Google." });
+      return;
+    }
+    const profile = await verifyGoogleCredential(credential);
+    const user = upsertGoogleUser(profile);
+    const token = await createSessionToken(user);
+    setSessionCookie(response, token);
+    response.json({ ok: true, user: publicUser(user) });
+  } catch (error) {
+    console.error("Google auth failed:", error);
+    response.status(401).json({
+      error: error instanceof Error ? error.message : "Không đăng nhập được bằng Google.",
+      code: "auth_failed",
+    });
+  }
+});
+
+app.get("/api/me", requireAuth, (request: AuthedRequest, response) => {
+  // Làm mới kỳ hạn mức trước khi trả về, để badge không hiện số cũ sau đầu tháng.
+  const user = ensureCurrentPeriod(request.user!);
+  response.json({ user: publicUser(user) });
+});
+
+app.post("/api/auth/logout", async (request, response) => {
+  // Thu hồi token phía server trước khi xoá cookie, để cookie bị lộ không còn dùng được.
+  const user = await loadUserFromRequest(request);
+  if (user) revokeUserSessions(user.id);
+  clearSessionCookie(response);
+  response.json({ ok: true });
+});
+
+app.post("/api/usage/heartbeat", requireAuth, requireQuota, (request: AuthedRequest, response) => {
+  // Thời gian dùng được đo ở server trong kết nối realtime; heartbeat chỉ trả trạng thái cho UI.
+  // requireQuota đã chặn trường hợp hết quota và gắn header cảnh báo nếu sắp hết.
+  response.json({ user: publicUser(request.user!) });
+});
+
+app.get("/api/plans", requireAuth, (_request, response) => {
+  response.json({
+    plans: listPlans().map((plan) => ({
+      id: plan.id,
+      name: plan.name,
+      kind: plan.kind,
+      monthlySeconds: plan.monthly_seconds,
+      durationSeconds: plan.duration_seconds,
+      priceVnd: plan.price_vnd,
+      description: plan.description,
+    })),
+  });
+});
+
+app.post("/api/billing/orders", requireAuth, orderLimit, (request: AuthedRequest, response) => {
+  const body = request.body as { planId?: unknown };
+  const planId = typeof body.planId === "string" && body.planId.trim() ? body.planId.trim() : "pro";
+  try {
+    const order = createOrderForPlan(request.user!.id, planId);
+    response.json({ order: publicOrder(order) });
+  } catch (error) {
+    response.status(503).json({
+      error: error instanceof Error ? error.message : "Không tạo được đơn thanh toán.",
+    });
+  }
+});
+
+app.get("/api/billing/orders/:id", requireAuth, (request: AuthedRequest, response) => {
+  const order = getOrderById(String(request.params.id || ""));
+  if (!order || order.user_id !== request.user!.id) {
+    response.status(404).json({ error: "Không tìm thấy đơn thanh toán." });
+    return;
+  }
+  response.json({ order: publicOrder(order) });
+});
+
+app.post("/api/billing/sepay-webhook", (request, response) => {
+  try {
+    assertSepayAuthorized(request);
+    const result = applySepayPayment(request.body as {
+      content?: unknown;
+      description?: unknown;
+      transferAmount?: unknown;
+      amount?: unknown;
+      referenceCode?: unknown;
+    });
+    response.json({ ok: true, ...result });
+  } catch (error) {
+    const status = (error as Error & { status?: number }).status || 400;
+    response.status(status).json({
+      error: error instanceof Error ? error.message : "Webhook lỗi.",
+    });
+  }
 });
 
 app.post(
   "/api/transcribe",
+  requireAuth,
+  requireQuota,
+  transcribeLimit,
   (request, response, next) => {
     transcriptionUpload.single("file")(request, response, (error) => {
       if (error instanceof multer.MulterError) {
@@ -160,10 +360,10 @@ app.post(
       return;
     }
 
-    const apiKey = process.env.LLM_API_KEY;
+    const { apiKey, baseUrl, model } = transcriptionConfig();
     if (!apiKey) {
       response.status(503).json({
-        error: "Backend chưa được cấu hình LLM_API_KEY. Hãy tạo file .env từ .env.example.",
+        error: "Backend chưa được cấu hình API key cho STT. Hãy tạo file .env từ .env.example.",
       });
       return;
     }
@@ -179,8 +379,25 @@ app.post(
       ? request.body.language.trim().toLowerCase().split(/[-_]/, 1)[0]
       : "";
     const language = requestedLanguage in languages ? requestedLanguage as LanguageCode : "";
-    const baseUrl = (process.env.LLM_BASE_URL || "http://localhost:8001").replace(/\/$/, "");
-    const model = process.env.TRANSCRIPTION_MODEL || "whisper-1";
+
+    // Không tin duration_ms do client gửi: lấy mức lớn hơn giữa số client báo và thời lượng
+    // ước tính từ kích thước file WebM ở bitrate MediaRecorder đang dùng (32 kbps).
+    // Giới hạn 60 giây mỗi đoạn để client không gian lận thời lượng.
+    const estimatedMs = Math.round(request.file.size * 8 / 32_000 * 1000);
+    const billedMs = Math.min(Math.max(durationMs ?? 0, estimatedMs), 60_000);
+    const billedSeconds = Math.ceil(billedMs / 1000);
+
+    // Trừ hạn mức TRƯỚC khi gọi STT, cùng lý do với /api/translate: request song song
+    // không được cùng lọt qua bước kiểm tra rồi cùng tiêu tiền. Lỗi thì hoàn lại.
+    const userId = (request as AuthedRequest).user!.id;
+    if (!tryConsumeSeconds(userId, billedSeconds)) {
+      response.status(402).json({
+        error: "Đã hết hạn mức tháng này. Mua thêm phút hoặc nâng cấp để tiếp tục.",
+        code: "quota_exhausted",
+      });
+      return;
+    }
+
     const controller = new AbortController();
 
     request.on("aborted", () => controller.abort());
@@ -208,6 +425,7 @@ app.post(
       if (!upstream.ok) {
         const message = await upstream.text();
         console.error(`Transcription upstream error ${upstream.status}:`, message.slice(0, 500));
+        refundSeconds(userId, billedSeconds);
         response.status(502).json({ error: `Dịch vụ nhận giọng nói trả về lỗi ${upstream.status}.` });
         return;
       }
@@ -220,14 +438,29 @@ app.post(
       const languageCode = rawLanguageCode.trim();
       response.json(languageCode ? { text, languageCode } : { text });
     } catch (error) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) {
+        refundSeconds(userId, billedSeconds);
+        return;
+      }
       console.error("Transcription request failed:", error);
+      refundSeconds(userId, billedSeconds);
       response.status(502).json({ error: "Không kết nối được tới dịch vụ nhận giọng nói." });
     }
   },
 );
 
-app.post("/api/translate", async (request, response) => {
+// Quy đổi ký tự sang giây để dùng chung một đơn vị với quota ghi âm.
+// 100 ký tự ≈ 1 giây hội thoại; làm tròn lên và luôn tính ít nhất 1 giây.
+function charsPerSecond() {
+  const value = Number(process.env.TRANSLATE_CHARS_PER_SECOND || 100);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 100;
+}
+
+function billedSecondsForText(text: string) {
+  return Math.max(1, Math.ceil(text.length / charsPerSecond()));
+}
+
+app.post("/api/translate", requireAuth, requireQuota, translateLimit, async (request, response) => {
   const body = request.body as {
     text?: unknown;
     source?: unknown;
@@ -250,7 +483,7 @@ app.post("/api/translate", async (request, response) => {
     return;
   }
 
-  const apiKey = process.env.LLM_API_KEY;
+  const { apiKey, baseUrl, model } = llmConfig();
   if (!apiKey) {
     response.status(503).json({
       error: "Backend chưa được cấu hình LLM_API_KEY. Hãy tạo file .env từ .env.example.",
@@ -258,8 +491,17 @@ app.post("/api/translate", async (request, response) => {
     return;
   }
 
-  const baseUrl = (process.env.LLM_BASE_URL || "http://localhost:8001").replace(/\/$/, "");
-  const model = process.env.LLM_MODEL || "gpt-5-5-mini";
+  // Trừ hạn mức TRƯỚC khi gọi LLM: nhiều request song song không thể cùng lọt qua
+  // bước kiểm tra rồi cùng tiêu tiền. Thất bại thì hoàn lại bên dưới.
+  const billedSeconds = billedSecondsForText(text);
+  if (!tryConsumeSeconds((request as AuthedRequest).user!.id, billedSeconds)) {
+    response.status(402).json({
+      error: "Đã hết hạn mức tháng này. Mua thêm phút hoặc nâng cấp để tiếp tục.",
+      code: "quota_exhausted",
+    });
+    return;
+  }
+
   const controller = new AbortController();
 
   request.on("aborted", () => controller.abort());
@@ -301,6 +543,7 @@ app.post("/api/translate", async (request, response) => {
     if (!upstream.ok) {
       const upstreamMessage = await upstream.text();
       console.error(`LLM upstream error ${upstream.status}:`, upstreamMessage.slice(0, 500));
+      refundSeconds((request as AuthedRequest).user!.id, billedSeconds);
       response.status(502).json({
         error: `Dịch vụ dịch trả về lỗi ${upstream.status}.`,
       });
@@ -312,11 +555,14 @@ app.post("/api/translate", async (request, response) => {
     };
     const translation = result.choices?.[0]?.message?.content?.trim() || "";
     if (!translation) {
+      refundSeconds((request as AuthedRequest).user!.id, billedSeconds);
       response.status(502).json({ error: "Mô hình không trả về bản dịch." });
       return;
     }
-    response.json({ translation });
+    const updated = getUserById((request as AuthedRequest).user!.id);
+    response.json({ translation, user: updated ? publicUser(updated) : undefined });
   } catch (error) {
+    refundSeconds((request as AuthedRequest).user!.id, billedSeconds);
     if (controller.signal.aborted) {
       if (!response.writableEnded) response.end();
       return;
@@ -329,7 +575,7 @@ app.post("/api/translate", async (request, response) => {
   }
 });
 
-app.post("/api/summarize", async (request, response) => {
+app.post("/api/summarize", requireAuth, requireQuota, summarizeLimit, async (request, response) => {
   const body = request.body as {
     entries?: unknown;
     outputLanguage?: unknown;
@@ -369,7 +615,7 @@ app.post("/api/summarize", async (request, response) => {
     return;
   }
 
-  const apiKey = process.env.LLM_API_KEY;
+  const { apiKey, baseUrl, model } = llmConfig();
   if (!apiKey) {
     response.status(503).json({
       error: "Backend chưa được cấu hình LLM_API_KEY. Hãy tạo file .env từ .env.example.",
@@ -383,8 +629,16 @@ app.post("/api/summarize", async (request, response) => {
     typeof outputLanguageCode === "string" && outputLanguageCode in languages
       ? languages[outputLanguageCode as LanguageCode]
       : languages.vi;
-  const baseUrl = (process.env.LLM_BASE_URL || "http://localhost:8001").replace(/\/$/, "");
-  const model = process.env.LLM_MODEL || "gpt-5-5-mini";
+  // Trừ hạn mức trước khi gọi LLM, hoàn lại nếu lời gọi thất bại.
+  const summaryBilledSeconds = billedSecondsForText(transcript);
+  if (!tryConsumeSeconds((request as AuthedRequest).user!.id, summaryBilledSeconds)) {
+    response.status(402).json({
+      error: "Đã hết hạn mức tháng này. Mua thêm phút hoặc nâng cấp để tiếp tục.",
+      code: "quota_exhausted",
+    });
+    return;
+  }
+
   const controller = new AbortController();
 
   request.on("aborted", () => controller.abort());
@@ -425,6 +679,7 @@ app.post("/api/summarize", async (request, response) => {
     if (!upstream.ok) {
       const message = await upstream.text();
       console.error(`LLM summary error ${upstream.status}:`, message.slice(0, 500));
+      refundSeconds((request as AuthedRequest).user!.id, summaryBilledSeconds);
       response.status(502).json({ error: `Dịch vụ AI trả về lỗi ${upstream.status}.` });
       return;
     }
@@ -434,15 +689,406 @@ app.post("/api/summarize", async (request, response) => {
     };
     const summary = data.choices?.[0]?.message?.content?.trim();
     if (!summary) {
+      refundSeconds((request as AuthedRequest).user!.id, summaryBilledSeconds);
       response.status(502).json({ error: "AI không trả về nội dung biên bản." });
       return;
     }
-    response.json({ summary });
+    const updated = getUserById((request as AuthedRequest).user!.id);
+    response.json({ summary, user: updated ? publicUser(updated) : undefined });
   } catch (error) {
+    refundSeconds((request as AuthedRequest).user!.id, summaryBilledSeconds);
     if (controller.signal.aborted) return;
     console.error("Summary request failed:", error);
     response.status(502).json({ error: "Không kết nối được tới dịch vụ AI." });
   }
+});
+
+function parsePaging(query: Record<string, unknown>) {
+  const limit = Math.min(100, Math.max(1, Number(query.limit) || 25));
+  const offset = Math.max(0, Number(query.offset) || 0);
+  return { limit, offset };
+}
+
+// Giới hạn số lần thử đăng nhập admin theo IP để chống dò mật khẩu.
+const adminLoginAttempts = new Map<string, { count: number; resetAt: number }>();
+const ADMIN_LOGIN_WINDOW_MS = 10 * 60 * 1_000;
+const ADMIN_LOGIN_MAX_ATTEMPTS = 10;
+// Mỗi lượt thử đều chạy scrypt (~100ms CPU); không chặn số lượng IP thì kẻ tấn công
+// có thể xoay IP và làm cạn CPU. Bộ đếm này là giới hạn toàn cục.
+const adminLoginGlobal = { count: 0, resetAt: 0 };
+const ADMIN_LOGIN_GLOBAL_MAX = 60;
+const ADMIN_LOGIN_GLOBAL_WINDOW_MS = 10 * 60 * 1_000;
+const ADMIN_LOGIN_MAP_LIMIT = 5_000;
+
+function globalLoginBlocked() {
+  const now = Date.now();
+  if (adminLoginGlobal.resetAt <= now) {
+    adminLoginGlobal.count = 0;
+    adminLoginGlobal.resetAt = now + ADMIN_LOGIN_GLOBAL_WINDOW_MS;
+  }
+  return adminLoginGlobal.count >= ADMIN_LOGIN_GLOBAL_MAX;
+}
+
+// Map không được phình vô hạn khi kẻ tấn công xoay IP: dọn mục hết hạn, chạm trần thì
+// bỏ mục cũ nhất (Map giữ thứ tự chèn).
+function pruneAdminLoginAttempts(now: number) {
+  for (const [key, entry] of adminLoginAttempts) {
+    if (entry.resetAt <= now) adminLoginAttempts.delete(key);
+  }
+  while (adminLoginAttempts.size >= ADMIN_LOGIN_MAP_LIMIT) {
+    const oldest = adminLoginAttempts.keys().next();
+    if (oldest.done) break;
+    adminLoginAttempts.delete(oldest.value);
+  }
+}
+
+// Server chạy sau Cloudflare Tunnel nên mọi request tới từ cùng một loopback IP;
+// dùng CF-Connecting-IP để giới hạn theo từng client thay vì khóa cả hệ thống.
+//
+// Chỉ tin header này khi server thực sự chỉ nhận kết nối từ loopback (mặc định).
+// Nếu bind ra ngoài (HOST=0.0.0.0) thì client gọi thẳng có thể tự đặt header và vô hiệu
+// hoá giới hạn đăng nhập, nên khi đó bỏ qua header và dùng địa chỉ socket thật.
+function behindLocalTunnel() {
+  return listenHost() !== "0.0.0.0" && listenHost() !== "::";
+}
+
+function listenHost() {
+  return (process.env.HOST || "127.0.0.1").trim();
+}
+
+function clientIp(request: { headers: Record<string, unknown>; socket: { remoteAddress?: string } }) {
+  if (behindLocalTunnel()) {
+    const forwarded = request.headers["cf-connecting-ip"];
+    if (typeof forwarded === "string" && forwarded.trim()) return forwarded.trim();
+  }
+  return request.socket.remoteAddress || "unknown";
+}
+
+function adminLoginBlocked(ip: string) {
+  const now = Date.now();
+  const entry = adminLoginAttempts.get(ip);
+  if (!entry || entry.resetAt <= now) return false;
+  return entry.count >= ADMIN_LOGIN_MAX_ATTEMPTS;
+}
+
+function recordAdminLoginFailure(ip: string) {
+  const now = Date.now();
+  adminLoginGlobal.count += 1;
+  pruneAdminLoginAttempts(now);
+  const entry = adminLoginAttempts.get(ip);
+  if (!entry || entry.resetAt <= now) {
+    adminLoginAttempts.set(ip, { count: 1, resetAt: now + ADMIN_LOGIN_WINDOW_MS });
+    return;
+  }
+  entry.count += 1;
+}
+
+app.get("/api/admin/session", async (request, response) => {
+  if (!adminConfigured()) {
+    response.json({ configured: false, authenticated: false });
+    return;
+  }
+  const account = await loadAdminFromRequest(request);
+  response.json({ configured: true, authenticated: Boolean(account), username: account?.username || null });
+});
+
+app.post("/api/admin/login", async (request, response) => {
+  if (!adminConfigured()) {
+    response.status(503).json({ error: "Chưa cấu hình tài khoản quản trị." });
+    return;
+  }
+  const ip = clientIp(request);
+  if (globalLoginBlocked() || adminLoginBlocked(ip)) {
+    response.status(429).json({ error: "Quá nhiều lần đăng nhập thất bại. Thử lại sau 10 phút." });
+    return;
+  }
+  const body = request.body as { username?: unknown; password?: unknown };
+  const username = typeof body.username === "string" ? body.username : "";
+  const password = typeof body.password === "string" ? body.password : "";
+  if (!username.trim() || !password) {
+    response.status(400).json({ error: "Nhập tên đăng nhập và mật khẩu." });
+    return;
+  }
+  const account = authenticateAdmin(username, password);
+  if (!account) {
+    recordAdminLoginFailure(ip);
+    response.status(401).json({ error: "Tên đăng nhập hoặc mật khẩu không đúng." });
+    return;
+  }
+  adminLoginAttempts.delete(ip);
+  setAdminCookie(response, await createAdminToken(account));
+  response.json({ ok: true, username: account.username });
+});
+
+app.post("/api/admin/logout", (_request, response) => {
+  clearAdminCookie(response);
+  response.json({ ok: true });
+});
+
+app.get("/api/admin/stats", requireAdmin, (_request, response) => {
+  response.json({ stats: adminStats() });
+});
+
+app.get("/api/admin/settings/billing", requireAdmin, (_request, response) => {
+  response.json({ billing: billingSettingsForAdmin() });
+});
+
+// Đổi mật khẩu quản trị ngay trong app. Không có màn hình này thì người vận hành
+// phải SSH vào máy chủ chạy seed mỗi lần đổi mật khẩu.
+app.post("/api/admin/password", requireAdmin, async (request: AdminRequest, response) => {
+  const body = request.body as { currentPassword?: unknown; newPassword?: unknown };
+  const currentPassword = typeof body.currentPassword === "string" ? body.currentPassword : "";
+  const newPassword = typeof body.newPassword === "string" ? body.newPassword : "";
+  const account = request.adminAccount!;
+  if (!verifyPasswordHash(currentPassword, account.password_hash)) {
+    response.status(401).json({ error: "Mật khẩu hiện tại không đúng." });
+    return;
+  }
+  if (newPassword.length < 12) {
+    response.status(400).json({ error: "Mật khẩu mới phải dài tối thiểu 12 ký tự." });
+    return;
+  }
+  if (newPassword === currentPassword) {
+    response.status(400).json({ error: "Mật khẩu mới phải khác mật khẩu hiện tại." });
+    return;
+  }
+  const updated = updateAdminPassword(account.username, encodePasswordHash(newPassword))!;
+  // Fingerprint đổi theo hash mật khẩu nên mọi phiên cũ đã bị thu hồi; cấp cookie mới
+  // để chính người vừa đổi không bị đăng xuất.
+  setAdminCookie(response, await createAdminToken(updated));
+  response.json({ ok: true });
+});
+
+app.put("/api/admin/settings/billing", requireAdmin, (request, response) => {
+  const body = request.body as {
+    bankBin?: unknown;
+    bankAccount?: unknown;
+    bankAccountName?: unknown;
+    upgradeAmountVnd?: unknown;
+    sepayWebhookApiKey?: unknown;
+  };
+  try {
+    saveBillingSettings({
+      bankBin: String(body.bankBin ?? "").trim(),
+      bankAccount: String(body.bankAccount ?? "").trim(),
+      bankAccountName: String(body.bankAccountName ?? "").trim(),
+      upgradeAmountVnd: Number(body.upgradeAmountVnd),
+      // undefined = giữ nguyên khóa cũ; "" = xóa khóa trong DB (quay về .env nếu có).
+      sepayWebhookApiKey: body.sepayWebhookApiKey === undefined
+        ? null
+        : String(body.sepayWebhookApiKey),
+    });
+    response.json({ ok: true, billing: billingSettingsForAdmin() });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "Cấu hình không hợp lệ." });
+  }
+});
+
+app.get("/api/admin/plans", requireAdmin, (_request, response) => {
+  const plans = listPlans({ includeInactive: true });
+  response.json({
+    plans: plans.map((plan) => ({
+      id: plan.id,
+      name: plan.name,
+      kind: plan.kind,
+      monthlySeconds: plan.monthly_seconds,
+      durationSeconds: plan.duration_seconds,
+      priceVnd: plan.price_vnd,
+      description: plan.description,
+      sortOrder: plan.sort_order,
+      active: Boolean(plan.active),
+      userCount: countUsersOnPlan(plan.id),
+    })),
+  });
+});
+
+app.put("/api/admin/plans/:id", requireAdmin, (request, response) => {
+  const body = request.body as Partial<PlanInput>;
+  try {
+    const plan = upsertPlan({
+      id: String(request.params.id || ""),
+      name: String(body.name ?? ""),
+      kind: body.kind === "event" ? "event" : "subscription",
+      monthlySeconds: Number(body.monthlySeconds ?? 0),
+      durationSeconds: Number(body.durationSeconds ?? 0),
+      priceVnd: Number(body.priceVnd ?? 0),
+      description: String(body.description ?? ""),
+      sortOrder: Number(body.sortOrder ?? 0),
+      active: body.active !== false,
+    });
+    response.json({
+      plan: {
+        id: plan.id,
+        name: plan.name,
+        kind: plan.kind,
+        monthlySeconds: plan.monthly_seconds,
+        durationSeconds: plan.duration_seconds,
+        priceVnd: plan.price_vnd,
+        description: plan.description,
+        sortOrder: plan.sort_order,
+        active: Boolean(plan.active),
+        userCount: countUsersOnPlan(plan.id),
+      },
+    });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "Gói không hợp lệ." });
+  }
+});
+
+// Cấp gói trực tiếp cho một người dùng, không qua thanh toán (bù trừ, hỗ trợ).
+app.post("/api/admin/users/:id/grant", requireAdmin, (request, response) => {
+  const body = request.body as { planId?: unknown; seconds?: unknown };
+  const planId = typeof body.planId === "string" ? body.planId.trim() : "";
+  if (!planId) {
+    response.status(400).json({ error: "Chọn gói cần cấp." });
+    return;
+  }
+  const seconds = body.seconds === undefined ? undefined : Number(body.seconds);
+  if (seconds !== undefined && (!Number.isFinite(seconds) || seconds < 0)) {
+    response.status(400).json({ error: "Số giây không hợp lệ." });
+    return;
+  }
+  try {
+    const user = grantPlanToUser(String(request.params.id || ""), planId, seconds);
+    if (!user) {
+      response.status(404).json({ error: "Không tìm thấy người dùng." });
+      return;
+    }
+    response.json({ user: publicUser(user) });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "Cấp gói thất bại." });
+  }
+});
+
+app.delete("/api/admin/plans/:id", requireAdmin, (request, response) => {
+  const id = String(request.params.id || "");
+  try {
+    const plan = getPlanById(id);
+    if (!plan) {
+      response.status(404).json({ error: "Không tìm thấy gói." });
+      return;
+    }
+    deactivatePlan(id);
+    response.json({ ok: true });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "Không tắt được gói." });
+  }
+});
+
+app.get("/api/admin/payments/unmatched", requireAdmin, (_request, response) => {
+  response.json({
+    payments: listUnmatchedPayments().map((payment) => ({
+      id: payment.id,
+      providerTxnId: payment.provider_txn_id,
+      orderId: payment.order_id,
+      userId: payment.user_id,
+      receivedVnd: payment.received_vnd,
+      transferCode: payment.transfer_code,
+      createdAt: payment.created_at,
+    })),
+  });
+});
+
+// Cộng tay khi khách chuyển thiếu mã hoặc chuyển thừa.
+app.post("/api/admin/payments/:id/credit", requireAdmin, (request, response) => {
+  const body = request.body as { userId?: unknown; seconds?: unknown; markMatched?: unknown };
+  const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+  const seconds = Number(body.seconds);
+  if (!userId) {
+    response.status(400).json({ error: "Thiếu người dùng cần cộng." });
+    return;
+  }
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    response.status(400).json({ error: "Số giây phải lớn hơn 0." });
+    return;
+  }
+  const user = creditUserSeconds(userId, seconds);
+  if (!user) {
+    response.status(404).json({ error: "Không tìm thấy người dùng." });
+    return;
+  }
+  if (body.markMatched !== false) markPaymentMatched(String(request.params.id || ""), userId);
+  response.json({ user: publicUser(user) });
+});
+
+app.get("/api/admin/revenue", requireAdmin, (request, response) => {
+  const days = Math.min(365, Math.max(7, Number(request.query.days) || 30));
+  response.json({ days, revenue: adminRevenueSummary(days) });
+});
+
+app.get("/api/admin/users", requireAdmin, (request, response) => {
+  const { limit, offset } = parsePaging(request.query);
+  const search = typeof request.query.search === "string" ? request.query.search : "";
+  const { total, rows } = listUsersForAdmin({ search, limit, offset });
+  response.json({ total, limit, offset, users: rows.map(publicAdminUser) });
+});
+
+app.get("/api/admin/users/:id", requireAdmin, (request, response) => {
+  const user = getAdminUserById(String(request.params.id || ""));
+  if (!user) {
+    response.status(404).json({ error: "Không tìm thấy người dùng." });
+    return;
+  }
+  response.json({ user: publicAdminUser(user) });
+});
+
+app.patch("/api/admin/users/:id", requireAdmin, (request: AdminRequest, response) => {
+  const body = request.body as { plan?: unknown; quotaSeconds?: unknown; resetUsage?: unknown };
+  const update: { plan?: UserPlan; quotaSeconds?: number; resetUsage?: boolean } = {};
+  if (body.plan !== undefined) {
+    if (typeof body.plan !== "string" || !getPlanById(body.plan)) {
+      response.status(400).json({ error: "Gói không tồn tại." });
+      return;
+    }
+    update.plan = body.plan;
+  }
+  if (body.quotaSeconds !== undefined) {
+    const value = Number(body.quotaSeconds);
+    if (!Number.isFinite(value) || value < 0) {
+      response.status(400).json({ error: "Hạn mức phải là số không âm." });
+      return;
+    }
+    update.quotaSeconds = value;
+  }
+  if (body.resetUsage !== undefined) update.resetUsage = Boolean(body.resetUsage);
+
+  try {
+    const user = updateUserByAdmin(String(request.params.id || ""), update);
+    if (!user) {
+      response.status(404).json({ error: "Không tìm thấy người dùng." });
+      return;
+    }
+    response.json({ user: publicUser(user) });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : "Cập nhật thất bại." });
+  }
+});
+
+app.get("/api/admin/orders", requireAdmin, (request, response) => {
+  const { limit, offset } = parsePaging(request.query);
+  const userId = typeof request.query.userId === "string" ? request.query.userId : undefined;
+  const { total, rows } = listOrdersForAdmin({ userId, limit, offset });
+  response.json({
+    total,
+    limit,
+    offset,
+    orders: rows.map((order) => ({
+      id: order.id,
+      userId: order.user_id,
+      userEmail: order.user_email,
+      userName: order.user_name,
+      amountVnd: order.amount_vnd,
+      transferCode: order.transfer_code,
+      status: order.status,
+      createdAt: order.created_at,
+      paidAt: order.paid_at,
+    })),
+  });
+});
+
+// API không tồn tại phải trả JSON 404, không được rơi xuống catch-all trả index.html.
+app.use("/api", (_request, response) => {
+  response.status(404).json({ error: "Không tìm thấy API." });
 });
 
 const distPath = resolve(process.cwd(), "dist");
@@ -453,23 +1099,61 @@ if (existsSync(distPath)) {
   });
 }
 
+// Lỗi phát sinh trong middleware (body quá lớn, JSON hỏng, upload sai...) phải trả JSON.
+// Không có handler này Express trả trang HTML mặc định, client gọi .json() sẽ vỡ.
+app.use((error: unknown, _request: express.Request, response: express.Response, next: express.NextFunction) => {
+  if (response.headersSent) {
+    next(error);
+    return;
+  }
+  const status = (error as { status?: unknown })?.status;
+  const statusCode = typeof status === "number" && status >= 400 && status < 600 ? status : 500;
+  const message = statusCode === 413
+    ? "Dữ liệu gửi lên quá lớn."
+    : statusCode === 400
+      ? "Dữ liệu gửi lên không hợp lệ."
+      : "Máy chủ gặp lỗi, vui lòng thử lại.";
+  if (statusCode >= 500) console.error("Unhandled request error:", error);
+  response.status(statusCode).json({ error: message });
+});
+
 const server = createServer(app);
+type UpgradeRequest = IncomingMessage & { user?: UserRow };
 const realtimeServer = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024 });
 
 server.on("upgrade", (request, socket, head) => {
-  const pathname = new URL(request.url || "/", "http://localhost").pathname;
-  if (pathname !== "/api/transcribe/realtime") {
+  const url = new URL(request.url || "/", "http://localhost");
+  if (url.pathname !== "/api/transcribe/realtime") {
     socket.destroy();
     return;
   }
-  realtimeServer.handleUpgrade(request, socket, head, (client) => {
-    realtimeServer.emit("connection", client, request);
+  void (async () => {
+    const loaded = await loadUserFromRequest(request);
+    if (!loaded) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    // Sang tháng mới hạn mức phải được làm mới ở đây, nếu không người dùng đã dùng hết
+    // hạn mức tháng trước sẽ bị chặn realtime cho tới khi gọi một route HTTP nào đó.
+    const user = ensureCurrentPeriod(loaded);
+    if (!hasQuota(user)) {
+      socket.write("HTTP/1.1 402 Payment Required\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    if (socket.destroyed) return;
+    realtimeServer.handleUpgrade(request, socket, head, (client) => {
+      realtimeServer.emit("connection", client, Object.assign(request, { user }));
+    });
+  })().catch(() => {
+    socket.write("HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n");
+    socket.destroy();
   });
 });
 
-realtimeServer.on("connection", (client) => {
-  const apiKey = process.env.LLM_API_KEY;
-  const model = process.env.TRANSCRIPTION_MODEL || "whisper-1";
+realtimeServer.on("connection", (client, request: UpgradeRequest) => {
+  const { apiKey, baseUrl: transcriptionBaseUrl, model } = transcriptionConfig();
   if (!apiKey || model !== "soniox-stt") {
     client.send(realtimeError(!apiKey
       ? "Backend chưa được cấu hình API key."
@@ -478,7 +1162,7 @@ realtimeServer.on("connection", (client) => {
     return;
   }
 
-  const baseUrl = new URL((process.env.LLM_BASE_URL || "http://localhost:8001").replace(/\/$/, ""));
+  const baseUrl = new URL(transcriptionBaseUrl);
   baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
   baseUrl.pathname = `${baseUrl.pathname.replace(/\/$/, "")}/v1/audio/transcriptions/realtime`;
   const upstream = new WebSocket(baseUrl, {
@@ -489,10 +1173,27 @@ realtimeServer.on("connection", (client) => {
   let pendingBytes = 0;
   let receivedSession = false;
   let closed = false;
+  const user = request.user!;
+  let meteredAt = Date.now();
+  const meterUsage = () => {
+    const elapsed = Math.floor((Date.now() - meteredAt) / 1000);
+    if (elapsed <= 0) return;
+    meteredAt += elapsed * 1000;
+    const updated = addUsedSeconds(user.id, elapsed);
+    if (updated && !hasQuota(updated)) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(realtimeError("Đã hết thời gian miễn phí. Hãy nâng cấp để tiếp tục.", "quota_exhausted"));
+      }
+      closeBoth();
+    }
+  };
+  const meterTimer = setInterval(meterUsage, 15_000);
 
   const closeBoth = () => {
     if (closed) return;
     closed = true;
+    clearInterval(meterTimer);
+    meterUsage();
     if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) client.close();
     if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) upstream.close();
   };
@@ -545,6 +1246,13 @@ realtimeServer.on("connection", (client) => {
   client.on("close", () => closeBoth());
 });
 
-server.listen(port, "0.0.0.0", () => {
-  console.log(`Translation server listening on http://localhost:${port}`);
+assertSessionSecret();
+// Mặc định chỉ nghe loopback vì Cloudflare Tunnel chạy cùng máy và proxy tới localhost:3001.
+// Đặt HOST=0.0.0.0 khi cần truy cập trực tiếp trong LAN (khi đó sẽ không tin CF-Connecting-IP).
+const host = listenHost();
+server.listen(port, host, () => {
+  console.log(`Translation server listening on http://${host}:${port}`);
+  if (host === "0.0.0.0") {
+    console.warn("Cảnh báo: server đang mở ra mạng ngoài. Giới hạn đăng nhập admin dùng IP socket thật.");
+  }
 });

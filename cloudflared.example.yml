@@ -1,0 +1,13 @@
+# Mẫu cấu hình Cloudflare Tunnel. Sao chép thành cloudflared.yml rồi điền tunnel ID
+# và đường dẫn credentials của máy bạn (file thật đã được .gitignore để tránh lộ khóa).
+#
+#   cp cloudflared.example.yml cloudflared.yml
+#   npm run public
+
+tunnel: <tunnel-id>
+credentials-file: /path/to/<tunnel-id>.json
+
+ingress:
+  - hostname: translate.example.com
+    service: http://localhost:3001
+  - service: http_status:404

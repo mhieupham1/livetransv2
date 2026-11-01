@@ -9,13 +9,54 @@ import {
   useState,
 } from "react";
 
-type LanguageCode = "vi" | "en" | "ja";
+type LanguageCode = "vi" | "en" | "ja" | "zh" | "ko" | "th";
 type SessionMode = "one-way" | "two-way";
 type SessionStatus = "idle" | "running" | "paused";
 type EntryStatus = "translating" | "done" | "error";
 type TextSize = "normal" | "large" | "extra-large" | "presentation";
 type RealtimePartial = { segmentId: string; text: string; language: LanguageCode };
 type RealtimeCompleted = { transcript: string; languages: string[] };
+type AuthUser = {
+  id: string;
+  email: string;
+  name: string;
+  picture: string;
+  plan: string;
+  planName?: string;
+  planKind?: "subscription" | "event";
+  quotaSeconds: number;
+  usedSeconds: number;
+  bonusSeconds?: number;
+  remainingSeconds: number | null;
+  unlimited: boolean;
+  periodResetsAt?: number;
+};
+type BillingOrder = {
+  id: string;
+  amountVnd: number;
+  transferCode: string;
+  status: "pending" | "paid" | "expired";
+  planId: string | null;
+  planName: string | null;
+  kind: string;
+  grantSeconds: number | null;
+  qrImageUrl: string;
+  bankAccount: string;
+  bankAccountName: string;
+};
+type BillingPlan = {
+  id: string;
+  name: string;
+  kind: "subscription" | "event";
+  monthlySeconds: number;
+  durationSeconds: number;
+  priceVnd: number;
+  description: string;
+};
+
+// Ngưỡng cảnh báo trước khi hết hạn mức (giây).
+const QUOTA_WARN_SECONDS = 300;
+const QUOTA_CRITICAL_SECONDS = 60;
 
 type ConversationEntry = {
   id: string;
@@ -28,16 +69,43 @@ type ConversationEntry = {
   sessionSecond: number;
 };
 
-const LANGUAGES: Record<LanguageCode, { name: string; short: string; speechCode: string }> = {
-  vi: { name: "Tiếng Việt", short: "VI", speechCode: "vi-VN" },
-  en: { name: "English", short: "EN", speechCode: "en-US" },
-  ja: { name: "日本語", short: "JA", speechCode: "ja-JP" },
+const LANGUAGES: Record<LanguageCode, { name: string; short: string; speechCode: string; sttHint: string }> = {
+  vi: { name: "Tiếng Việt", short: "VI", speechCode: "vi-VN", sttHint: "vietnamese" },
+  en: { name: "English", short: "EN", speechCode: "en-US", sttHint: "english" },
+  ja: { name: "日本語", short: "JA", speechCode: "ja-JP", sttHint: "japanese" },
+  zh: { name: "中文", short: "ZH", speechCode: "zh-CN", sttHint: "chinese" },
+  ko: { name: "한국어", short: "KO", speechCode: "ko-KR", sttHint: "korean" },
+  th: { name: "ไทย", short: "TH", speechCode: "th-TH", sttHint: "thai" },
 };
 
 const STORAGE_KEY = "relay-translation-session-v2";
 const TEXT_SIZE_STORAGE_KEY = "relay-transcript-text-size-v1";
 const MOBILE_MERGED_VIEW_STORAGE_KEY = "relay-mobile-merged-view-v1";
+const SETTINGS_STORAGE_KEY = "relay-settings-v1";
+const THEME_STORAGE_KEY = "relay-theme-v1";
+
+type ThemePreference = "light" | "dark" | "system";
+
+function loadThemePreference(): ThemePreference {
+  const saved = localStorage.getItem(THEME_STORAGE_KEY);
+  return saved === "light" || saved === "dark" ? saved : "system";
+}
+
+// "system" theo cài đặt máy; trình duyệt cũ không có matchMedia thì mặc định sáng.
+function resolveTheme(preference: ThemePreference): "light" | "dark" {
+  if (preference !== "system") return preference;
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+// Đủ khoá cho mọi ngôn ngữ đang hỗ trợ; khởi tạo bằng map để thêm ngôn ngữ mới
+// không phải sửa ba chỗ rời rạc.
+const emptyManualText = Object.fromEntries(
+  Object.keys(LANGUAGES).map((code) => [code, ""]),
+) as Record<LanguageCode, string>;
 const SILENCE_COMMIT_MS = 1_200;
+// Nhịp lấy mẫu VAD. setInterval (không phải rAF) để vẫn chạy khi tab bị ẩn.
+const VAD_INTERVAL_MS = 50;
+const USAGE_HEARTBEAT_MS = 15_000;
 const MIN_TRANSLATION_INTERVAL_MS = 700;
 const PCM_SAMPLE_RATE = 24_000;
 const PCM_PRE_ROLL_CHUNKS = 6;
@@ -119,12 +187,49 @@ function normalizeDetectedLanguage(value: string): LanguageCode | null {
   if (["vi", "vie", "vietnamese"].includes(base)) return "vi";
   if (["en", "eng", "english"].includes(base)) return "en";
   if (["ja", "jp", "jpn", "japanese"].includes(base)) return "ja";
+  if (["zh", "zho", "chi", "cmn", "chinese", "mandarin"].includes(base)) return "zh";
+  if (["ko", "kor", "korean"].includes(base)) return "ko";
+  if (["th", "tha", "thai"].includes(base)) return "th";
   return null;
 }
 
 function realtimeWebSocketUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}/api/transcribe/realtime`;
+}
+
+async function apiFetch(input: string, init: RequestInit = {}) {
+  const headers = new Headers(init.headers || {});
+  const response = await fetch(input, {
+    ...init,
+    credentials: "include",
+    headers,
+  });
+  return response;
+}
+
+function formatRemaining(seconds: number | null, unlimited: boolean) {
+  if (unlimited || seconds === null) return "Không giới hạn";
+  const total = Math.max(0, Math.floor(seconds));
+  if (total >= 86_400) {
+    // Gói Pro tính bằng tháng; hiển thị theo ngày thay vì "43200:00".
+    const days = Math.floor(total / 86_400);
+    const hours = Math.floor((total % 86_400) / 3_600);
+    return hours ? `${days} ngày ${hours} giờ` : `${days} ngày`;
+  }
+  if (total >= 3_600) {
+    // Gói 1–3 giờ: đọc theo giờ, tránh "180:00" khó hiểu.
+    const hours = Math.floor(total / 3_600);
+    const minutes = Math.floor((total % 3_600) / 60);
+    return minutes ? `${hours} giờ ${minutes} phút` : `${hours} giờ`;
+  }
+  const minutes = Math.floor(total / 60);
+  const rem = total % 60;
+  return `${minutes}:${String(rem).padStart(2, "0")}`;
+}
+
+function formatVnd(amount: number) {
+  return new Intl.NumberFormat("vi-VN").format(amount) + "đ";
 }
 
 function cleanRealtimeTranscript(value: string) {
@@ -174,24 +279,69 @@ function loadMobileMergedView() {
   return localStorage.getItem(MOBILE_MERGED_VIEW_STORAGE_KEY) !== "false";
 }
 
+// Ngữ cảnh thuật ngữ và các lựa chọn phiên dịch được nhớ giữa các lần mở trang:
+// người dùng thường dịch cho cùng một dự án nên nhập lại mỗi lần là vô nghĩa.
+type SavedSettings = {
+  context: string;
+  source: LanguageCode;
+  target: LanguageCode;
+  mode: SessionMode;
+  voiceEnabled: boolean;
+};
+
+function loadSettings(): Partial<SavedSettings> {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const settings: Partial<SavedSettings> = {};
+    if (typeof parsed.context === "string") settings.context = parsed.context.slice(0, 1_000);
+    if (typeof parsed.source === "string" && parsed.source in LANGUAGES) settings.source = parsed.source as LanguageCode;
+    if (typeof parsed.target === "string" && parsed.target in LANGUAGES) settings.target = parsed.target as LanguageCode;
+    if (parsed.mode === "one-way" || parsed.mode === "two-way") settings.mode = parsed.mode;
+    if (typeof parsed.voiceEnabled === "boolean") settings.voiceEnabled = parsed.voiceEnabled;
+    return settings;
+  } catch {
+    return {};
+  }
+}
+
+const savedSettings = loadSettings();
+
+// Wake Lock giữ màn hình sáng trong lúc đang phiên dịch — trên mobile, màn hình tắt
+// sẽ khiến người dùng mất dấu phiên và audio bị hệ điều hành hạ ưu tiên.
+// Không phải trình duyệt nào cũng hỗ trợ, nên mọi lỗi đều bỏ qua.
+type WakeLockSentinelLike = {
+  released: boolean;
+  release: () => Promise<void>;
+  addEventListener?: (type: "release", listener: () => void) => void;
+};
+
+function canWakeLock() {
+  return typeof navigator !== "undefined" && "wakeLock" in navigator;
+}
+
 export default function App() {
-  const [source, setSource] = useState<LanguageCode>("vi");
-  const [target, setTarget] = useState<LanguageCode>("en");
-  const [activeLanguage, setActiveLanguage] = useState<LanguageCode>("vi");
-  const [mode, setMode] = useState<SessionMode>("two-way");
+  const [source, setSource] = useState<LanguageCode>(savedSettings.source ?? "vi");
+  const [target, setTarget] = useState<LanguageCode>(savedSettings.target ?? "en");
+  const [activeLanguage, setActiveLanguage] = useState<LanguageCode>(savedSettings.source ?? "vi");
+  const [mode, setMode] = useState<SessionMode>(savedSettings.mode ?? "two-way");
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
+  // Bản ref để interval heartbeat đọc được trạng thái mới nhất mà không cần tạo lại timer.
+  const sessionStatusRef = useRef<SessionStatus>("idle");
   const [elapsed, setElapsed] = useState(0);
   const [entries, setEntries] = useState<ConversationEntry[]>(loadHistory);
-  const [manualText, setManualText] = useState<Record<LanguageCode, string>>({ vi: "", en: "", ja: "" });
+  const [manualText, setManualText] = useState<Record<LanguageCode, string>>(emptyManualText);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [transcriptionCount, setTranscriptionCount] = useState(0);
-  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(savedSettings.voiceEnabled ?? false);
   const [textSize, setTextSize] = useState<TextSize>(loadTextSize);
+  const [theme, setTheme] = useState<ThemePreference>(loadThemePreference);
   const [mobileHeaderCollapsed, setMobileHeaderCollapsed] = useState(false);
   const [mobileMergedView, setMobileMergedView] = useState(loadMobileMergedView);
   const [mobileTextInputVisible, setMobileTextInputVisible] = useState(false);
-  const [context, setContext] = useState("");
+  const [context, setContext] = useState(savedSettings.context ?? "");
   const [showSettings, setShowSettings] = useState(false);
   const [showSummary, setShowSummary] = useState(false);
   const [summary, setSummary] = useState("");
@@ -200,6 +350,21 @@ export default function App() {
   const [apiConfigured, setApiConfigured] = useState<boolean | null>(null);
   const [transcriptionModel, setTranscriptionModel] = useState("whisper-1");
   const [realtimePartial, setRealtimePartial] = useState<RealtimePartial | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [googleClientId, setGoogleClientId] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [billingConfigured, setBillingConfigured] = useState(false);
+  const [showUpgrade, setShowUpgrade] = useState(false);
+  const [showAccountMenu, setShowAccountMenu] = useState(false);
+  const [upgradeOrder, setUpgradeOrder] = useState<BillingOrder | null>(null);
+  const [upgradeError, setUpgradeError] = useState<string | null>(null);
+  const [isCreatingOrder, setIsCreatingOrder] = useState(false);
+  const [plans, setPlans] = useState<BillingPlan[]>([]);
+  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
+  const [quotaWarning, setQuotaWarning] = useState<"none" | "low" | "critical">("none");
+  const googleButtonRef = useRef<HTMLDivElement | null>(null);
 
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -232,8 +397,76 @@ export default function App() {
   const beginRealtimeRef = useRef<() => void>(() => undefined);
   const transcribeAudioRef = useRef<(audio: Blob, durationMs: number, language: LanguageCode, sessionSecond: number) => void>(() => undefined);
   const startSegmentRef = useRef<() => void>(() => undefined);
+  const stopSessionRef = useRef<() => void>(() => undefined);
   const panelScrollsRef = useRef<Record<string, HTMLDivElement | null>>({});
   const mergedInputRef = useRef<HTMLInputElement | null>(null);
+  const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
+  const wakeLockWantedRef = useRef(false);
+
+  // Xin wake lock; tự xin lại khi người dùng quay lại tab vì trình duyệt nhả lock
+  // mỗi lần trang bị ẩn.
+  const requestWakeLock = useCallback(async () => {
+    wakeLockWantedRef.current = true;
+    if (!canWakeLock() || wakeLockRef.current) return;
+    try {
+      const nav = navigator as Navigator & {
+        wakeLock: { request: (type: "screen") => Promise<WakeLockSentinelLike> };
+      };
+      const sentinel = await nav.wakeLock.request("screen");
+      wakeLockRef.current = sentinel;
+      sentinel.release = sentinel.release.bind(sentinel);
+      // Hệ điều hành có thể tự nhả (hết pin, chuyển app) — bỏ tham chiếu để lần sau xin lại.
+      sentinel.addEventListener?.("release", () => {
+        if (wakeLockRef.current === sentinel) wakeLockRef.current = null;
+      });
+    } catch {
+      // Không hỗ trợ hoặc bị từ chối: phiên vẫn chạy, chỉ là màn hình có thể tắt.
+      wakeLockRef.current = null;
+    }
+  }, []);
+
+  const releaseWakeLock = useCallback(() => {
+    wakeLockWantedRef.current = false;
+    const sentinel = wakeLockRef.current;
+    wakeLockRef.current = null;
+    void sentinel?.release().catch(() => undefined);
+  }, []);
+
+  // Khai báo trước mọi effect gọi tới nó (heartbeat, translate, transcribe) — dù closure
+  // vẫn chạy đúng sau render, thứ tự này tránh bẫy temporal dead zone.
+  const openUpgrade = useCallback(async (planId?: string) => {
+    setShowUpgrade(true);
+    setUpgradeError(null);
+    if (!billingConfigured) {
+      setUpgradeError("Chưa cấu hình tài khoản VietQR trên server.");
+      return;
+    }
+    // Không chọn gói thì mặc định là gói thuê bao rẻ nhất đang bán (trừ Free).
+    const target = planId
+      || selectedPlanId
+      || plans.find((plan) => plan.kind === "subscription" && plan.priceVnd > 0)?.id;
+    if (!target) {
+      setUpgradeError("Chưa có gói nào đang bán.");
+      return;
+    }
+    setSelectedPlanId(target);
+    setIsCreatingOrder(true);
+    try {
+      const response = await apiFetch("/api/billing/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ planId: target }),
+      });
+      const body = await response.json().catch(() => null) as { order?: BillingOrder; error?: string } | null;
+      if (!response.ok || !body?.order) throw new Error(body?.error || "Không tạo được đơn nâng cấp.");
+      setUpgradeOrder(body.order);
+    } catch (error) {
+      setUpgradeOrder(null);
+      setUpgradeError(error instanceof Error ? error.message : "Không tạo được đơn nâng cấp.");
+    } finally {
+      setIsCreatingOrder(false);
+    }
+  }, [billingConfigured, plans, selectedPlanId]);
 
   const recordingSupported = Boolean(
     typeof navigator.mediaDevices !== "undefined"
@@ -282,14 +515,158 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetch("/api/health")
-      .then((response) => response.json())
-      .then((data: { configured?: boolean; transcriptionModel?: string }) => {
+    let cancelled = false;
+    const bootstrap = async () => {
+      try {
+        const response = await apiFetch("/api/health");
+        const data = await response.json() as {
+          configured?: boolean;
+          transcriptionModel?: string;
+          authRequired?: boolean;
+          googleClientId?: string | null;
+          billingConfigured?: boolean;
+        };
+        if (cancelled) return;
         setApiConfigured(Boolean(data.configured));
         if (data.transcriptionModel) setTranscriptionModel(data.transcriptionModel);
-      })
-      .catch(() => setApiConfigured(false));
+        setBillingConfigured(Boolean(data.billingConfigured));
+        const needsAuth = Boolean(data.authRequired);
+        setAuthRequired(needsAuth);
+        setGoogleClientId(data.googleClientId || null);
+        if (needsAuth) {
+          // Hydrate session trước khi mở app, tránh nháy màn hình đăng nhập khi đã có cookie.
+          const me = await apiFetch("/api/me");
+          if (cancelled) return;
+          if (me.ok) {
+            const body = await me.json() as { user: AuthUser };
+            if (!cancelled) setUser(body.user);
+          }
+        }
+        if (!cancelled) setAuthReady(true);
+      } catch {
+        if (!cancelled) {
+          setApiConfigured(false);
+          setAuthReady(true);
+        }
+      }
+    };
+    void bootstrap();
+    return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (!authReady || !authRequired || user || !googleClientId) return;
+    let cancelled = false;
+    let tries = 0;
+
+    const handleCredential = async (response: { credential?: string }) => {
+      const credential = response.credential?.trim();
+      if (!credential) return;
+      setAuthError(null);
+      try {
+        const result = await apiFetch("/api/auth/google", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ credential }),
+        });
+        const body = await result.json().catch(() => null) as { user?: AuthUser; error?: string } | null;
+        if (!result.ok || !body?.user) throw new Error(body?.error || "Đăng nhập Google thất bại.");
+        setUser(body.user);
+      } catch (error) {
+        setAuthError(error instanceof Error ? error.message : "Đăng nhập Google thất bại.");
+      }
+    };
+
+    const renderButton = () => {
+      if (cancelled || !googleButtonRef.current || !window.google?.accounts?.id) return;
+      window.google.accounts.id.initialize({
+        client_id: googleClientId,
+        callback: handleCredential,
+        ux_mode: "popup",
+      });
+      googleButtonRef.current.innerHTML = "";
+      window.google.accounts.id.renderButton(googleButtonRef.current, {
+        type: "standard",
+        theme: "outline",
+        size: "large",
+        text: "signin_with",
+        shape: "pill",
+        width: 320,
+      });
+    };
+
+    const ensureScriptAndRender = () => {
+      if (cancelled) return;
+      if (!googleButtonRef.current) {
+        if (tries < 20) {
+          tries += 1;
+          window.setTimeout(ensureScriptAndRender, 50);
+        }
+        return;
+      }
+      const existing = document.querySelector<HTMLScriptElement>("script[data-google-gis]");
+      if (window.google?.accounts?.id) {
+        renderButton();
+        return;
+      }
+      if (existing) {
+        // Thẻ script trong index.html là async/defer: nếu nó đã tải xong (hoặc đang tải dở)
+        // thì sự kiện load đã bắn trước khi effect này chạy.
+        if (existing.dataset.loaded === "true") {
+          renderButton();
+          return;
+        }
+        existing.addEventListener("load", () => {
+          existing.dataset.loaded = "true";
+          renderButton();
+        }, { once: true });
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      script.dataset.googleGis = "true";
+      script.addEventListener("load", renderButton, { once: true });
+      document.head.appendChild(script);
+    };
+
+    ensureScriptAndRender();
+    return () => { cancelled = true; };
+  }, [authReady, authRequired, user, googleClientId]);
+
+  useEffect(() => {
+    if (!user) return;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const response = await apiFetch("/api/usage/heartbeat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ seconds: Math.round(USAGE_HEARTBEAT_MS / 1000) }),
+          });
+          const body = await response.json().catch(() => null) as {
+            user?: AuthUser;
+            error?: string;
+            code?: string;
+          } | null;
+          if (body?.user) setUser(body.user);
+          if (response.status === 402 || body?.code === "quota_exhausted") {
+            setNotice(body?.error || "Đã hết hạn mức tháng này. Mua thêm để tiếp tục.");
+            // Chỉ tự dừng và mở bảng mua khi đang trong phiên; lúc rảnh thì để người
+            // dùng chủ động bấm, tránh modal bật lên mỗi 15 giây.
+            if (sessionStatusRef.current === "running") {
+              stopSessionRef.current();
+              void openUpgrade();
+            }
+          }
+        } catch {
+          // Ignore transient heartbeat failures.
+        }
+      })();
+    }, USAGE_HEARTBEAT_MS);
+    return () => window.clearInterval(timer);
+  }, [user?.id]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(entries.slice(-100)));
@@ -302,9 +679,31 @@ export default function App() {
     localStorage.setItem(TEXT_SIZE_STORAGE_KEY, textSize);
   }, [textSize]);
 
+  // Ghi theme lên <html> để CSS đổi bảng màu; đổi theo OS khi chọn "system".
+  useEffect(() => {
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    const apply = () => {
+      document.documentElement.dataset.theme = resolveTheme(theme);
+    };
+    apply();
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+    if (theme !== "system" || !media) return;
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [theme]);
+
   useEffect(() => {
     localStorage.setItem(MOBILE_MERGED_VIEW_STORAGE_KEY, String(mobileMergedView));
   }, [mobileMergedView]);
+
+  useEffect(() => {
+    const settings: SavedSettings = { context, source, target, mode, voiceEnabled };
+    try {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    } catch {
+      // Chế độ riêng tư / hết dung lượng: mất lựa chọn đã lưu nhưng app vẫn chạy.
+    }
+  }, [context, source, target, mode, voiceEnabled]);
 
   useEffect(() => {
     if (!mobileTextInputVisible) return;
@@ -348,7 +747,7 @@ export default function App() {
     controllersRef.current.set(entry.id, controller);
 
     try {
-      const response = await fetch("/api/translate", {
+      const response = await apiFetch("/api/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -363,8 +762,20 @@ export default function App() {
       const body = (await response.json().catch(() => null)) as {
         translation?: string;
         error?: string;
+        user?: AuthUser;
+        code?: string;
       } | null;
-      if (!response.ok) throw new Error(body?.error || `Không thể dịch (HTTP ${response.status}).`);
+      if (!response.ok) {
+        // Hết hạn mức: mở bảng mua thêm thay vì chỉ báo lỗi khô khan.
+        if (response.status === 402 || body?.code === "quota_exhausted") {
+          if (body?.user) setUser(body.user);
+          setNotice(body?.error || "Đã hết hạn mức. Mua thêm để tiếp tục dịch.");
+          void openUpgrade();
+        }
+        throw new Error(body?.error || `Không thể dịch (HTTP ${response.status}).`);
+      }
+      // Server trừ hạn mức theo số ký tự; cập nhật lại badge mà không cần gọi /api/me.
+      if (body?.user) setUser(body.user);
       const finalText = body?.translation?.trim() || "";
       if (!finalText) throw new Error("Mô hình không trả về bản dịch.");
       updateEntry(entry.id, { translation: finalText, status: "done" });
@@ -420,6 +831,10 @@ export default function App() {
     activeLanguageRef.current = activeLanguage;
   }, [activeLanguage]);
 
+  useEffect(() => {
+    sessionStatusRef.current = sessionStatus;
+  }, [sessionStatus]);
+
   const routeTranscription = useCallback((
     rawText: string,
     detectedLanguages: string[],
@@ -470,13 +885,29 @@ export default function App() {
       form.append("language", language);
       if (context.trim()) form.append("prompt", context.trim());
 
-      const response = await fetch("/api/transcribe", { method: "POST", body: form });
+      const response = await apiFetch("/api/transcribe", {
+        method: "POST",
+        body: form,
+      });
       const body = (await response.json().catch(() => null)) as {
         text?: string;
         languageCode?: string;
         error?: string;
+        code?: string;
+        user?: AuthUser;
       } | null;
-      if (!response.ok) throw new Error(body?.error || `Không thể nhận giọng nói (HTTP ${response.status}).`);
+      if (!response.ok) {
+        // Hết hạn mức: xử lý giống /api/translate để người dùng thấy nút mua thêm
+        // thay vì một dòng lỗi không nói được phải làm gì.
+        if (response.status === 402 || body?.code === "quota_exhausted") {
+          if (body?.user) setUser(body.user);
+          setNotice(body?.error || "Đã hết hạn mức. Mua thêm để tiếp tục nhận giọng nói.");
+          stopSessionRef.current();
+          void openUpgrade();
+          return;
+        }
+        throw new Error(body?.error || `Không thể nhận giọng nói (HTTP ${response.status}).`);
+      }
       if (conversationEpoch !== conversationEpochRef.current) return;
       const text = body?.text?.trim();
       if (!text) return;
@@ -602,7 +1033,7 @@ export default function App() {
           transcript?: string;
           tokens?: Array<{ language?: string }>;
           languages?: Array<{ code?: string } | string>;
-          error?: { message?: string };
+          error?: { code?: string; message?: string };
         };
         if (event.type === "transcription.partial") {
           if (activeRealtimeSegmentRef.current !== segmentId) return;
@@ -627,6 +1058,10 @@ export default function App() {
           }
           cleanup();
         } else if (event.type === "error") {
+          if (event.error?.code === "quota_exhausted") {
+            setShowUpgrade(true);
+            stopSessionRef.current();
+          }
           cleanup(event.error?.message || "Dịch vụ STT realtime trả về lỗi.");
         }
       } catch {
@@ -722,7 +1157,7 @@ export default function App() {
             transcript?: string;
             tokens?: Array<{ language?: string }>;
             languages?: Array<{ code?: string } | string>;
-            error?: { message?: string };
+            error?: { code?: string; message?: string };
           };
           if (event.type === "transcription.partial") {
             if (activeRealtimeSegmentRef.current !== segmentId) return;
@@ -744,6 +1179,10 @@ export default function App() {
             ));
             settle({ transcript: cleanRealtimeTranscript(event.transcript || ""), languages: detectedLanguages });
           } else if (event.type === "error") {
+            if (event.error?.code === "quota_exhausted") {
+              setShowUpgrade(true);
+              stopSessionRef.current();
+            }
             socketFailure = event.error?.message || "Dịch vụ STT realtime trả về lỗi.";
             settle(null);
           }
@@ -866,7 +1305,7 @@ export default function App() {
 
   const stopAudioCapture = useCallback((transcribePending = true) => {
     captureActiveRef.current = false;
-    if (vadFrameRef.current !== null) cancelAnimationFrame(vadFrameRef.current);
+    if (vadFrameRef.current !== null) window.clearInterval(vadFrameRef.current);
     vadFrameRef.current = null;
     const recorder = mediaRecorderRef.current;
     if (recorder?.state === "recording") {
@@ -888,7 +1327,8 @@ export default function App() {
     speechDetectedRef.current = false;
     setIsSpeaking(false);
     setIsListening(false);
-  }, []);
+    releaseWakeLock();
+  }, [releaseWakeLock]);
 
   const startAudioCapture = useCallback(async () => {
     if (!recordingSupported) throw new Error("Trình duyệt chưa hỗ trợ truy cập và xử lý âm thanh từ micro.");
@@ -908,6 +1348,7 @@ export default function App() {
     audioContextRef.current = audioContext;
     captureActiveRef.current = true;
     setIsListening(true);
+    void requestWakeLock();
     if (supportedWebmMimeType()) {
       startSegmentRef.current();
     } else {
@@ -951,10 +1392,20 @@ export default function App() {
       } else if (speechDetectedRef.current && now - speechStartedAtRef.current > 30_000) {
         finishSegment(true);
       }
-      vadFrameRef.current = requestAnimationFrame(monitorVoice);
     };
-    vadFrameRef.current = requestAnimationFrame(monitorVoice);
+    // Dùng setInterval thay vì requestAnimationFrame: rAF bị treo khi tab bị ẩn hoặc
+    // màn hình khoá, khiến phiên dịch đứng im mà không báo lỗi. Interval vẫn chạy khi ẩn.
+    vadFrameRef.current = window.setInterval(monitorVoice, VAD_INTERVAL_MS);
   }, [beginPcmSegment, finishSegment, recordingSupported]);
+
+  // Trình duyệt nhả wake lock khi tab bị ẩn; quay lại thì xin lại nếu phiên còn chạy.
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible" && wakeLockWantedRef.current) void requestWakeLock();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [requestWakeLock]);
 
   useEffect(() => () => {
     controllersRef.current.forEach((controller) => controller.abort());
@@ -965,6 +1416,11 @@ export default function App() {
   }, [stopAudioCapture]);
 
   const startSession = async () => {
+    if (user && !user.unlimited && (user.remainingSeconds ?? 0) <= 0) {
+      setNotice("Đã hết thời gian miễn phí. Hãy nâng cấp để tiếp tục.");
+      setShowUpgrade(true);
+      return;
+    }
     if (sessionStatus === "idle") {
       setElapsed(0);
       elapsedRef.current = 0;
@@ -998,6 +1454,10 @@ export default function App() {
     elapsedRef.current = 0;
     setElapsed(0);
   };
+
+  useEffect(() => {
+    stopSessionRef.current = stopSession;
+  });
 
   const switchSpeaker = (language: LanguageCode) => {
     if (language === activeLanguage) return;
@@ -1074,19 +1534,150 @@ export default function App() {
     setEntries((current) => current.filter((entry) => entry.id !== id));
   };
 
+  const logout = async () => {
+    stopSessionRef.current();
+    setShowAccountMenu(false);
+    await apiFetch("/api/auth/logout", { method: "POST" });
+    setUser(null);
+    setUpgradeOrder(null);
+    setShowUpgrade(false);
+  };
+
+  useEffect(() => {
+    if (!showAccountMenu) return;
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest(".account-controls")) setShowAccountMenu(false);
+    };
+    window.addEventListener("mousedown", onPointerDown);
+    return () => window.removeEventListener("mousedown", onPointerDown);
+  }, [showAccountMenu]);
+
+  const renderAccountControls = (placement: "top" | "desktop" = "top") => {
+    if (!user) return null;
+    return (
+      <div className={`account-controls account-controls-${placement}`}>
+        <button
+          type="button"
+          className={`quota-badge ${user.plan === "pro" ? "pro" : "free"} ${quotaWarning !== "none" ? "warn" : ""}`}
+          onClick={() => void openUpgrade()}
+          title={
+            user.unlimited
+              ? "Không giới hạn"
+              : `${formatRemaining(user.remainingSeconds, user.unlimited)} còn lại${
+                user.periodResetsAt ? ` · làm mới ${new Date(user.periodResetsAt).toLocaleDateString("vi-VN")}` : ""
+              }`
+          }
+        >
+          <span>{user.planName || (user.plan === "pro" ? "Pro" : "Free")}</span>
+          <strong>{formatRemaining(user.remainingSeconds, user.unlimited)}</strong>
+        </button>
+        <div className="account-menu-wrap">
+          <button
+            type="button"
+            className={`account-avatar-button ${showAccountMenu ? "open" : ""}`}
+            onClick={() => setShowAccountMenu((open) => !open)}
+            aria-label="Tài khoản"
+            aria-expanded={showAccountMenu}
+          >
+            {user.picture
+              ? <img src={user.picture} alt="" />
+              : <span>{(user.name || user.email || "?").slice(0, 1).toUpperCase()}</span>}
+          </button>
+          {showAccountMenu ? (
+            <div className="account-menu" role="menu">
+              <div className="account-menu-head">
+                <strong>{user.name || "Người dùng"}</strong>
+                <small>{user.email}</small>
+              </div>
+              <button type="button" role="menuitem" onClick={() => { setShowAccountMenu(false); void openUpgrade(); }}>
+                {user.plan === "pro" ? "Mua thêm thời gian" : "Nâng cấp / mua thêm"}
+              </button>
+              <button type="button" role="menuitem" className="danger" onClick={() => void logout()}>
+                Đăng xuất
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  };
+
+  // Tải danh sách gói một lần khi đã đăng nhập, để mở modal nâng cấp là có sẵn.
+  useEffect(() => {
+    if (!user) return;
+    void (async () => {
+      const response = await apiFetch("/api/plans");
+      if (!response.ok) return;
+      const body = await response.json() as { plans: BillingPlan[] };
+      setPlans(body.plans);
+    })();
+  }, [user?.id]);
+
+  // Cảnh báo sớm theo hạn mức còn lại: 5 phút → banner, 1 phút → rung + thông báo.
+  useEffect(() => {
+    if (!user || user.unlimited || user.remainingSeconds === null) {
+      setQuotaWarning("none");
+      return;
+    }
+    const next = user.remainingSeconds <= QUOTA_CRITICAL_SECONDS
+      ? "critical"
+      : user.remainingSeconds <= QUOTA_WARN_SECONDS
+        ? "low"
+        : "none";
+    setQuotaWarning((previous) => {
+      // Chỉ báo đúng một lần khi vừa vượt ngưỡng, tránh rung lặp lại mỗi lần heartbeat.
+      if (next === "critical" && previous !== "critical") {
+        navigator.vibrate?.([120, 60, 120]);
+        setNotice("Chỉ còn dưới 1 phút hạn mức. Phiên sẽ tự dừng khi hết — bấm để mua thêm.");
+      }
+      return next;
+    });
+  }, [user?.remainingSeconds, user?.unlimited]);
+
+  useEffect(() => {
+    if (!showUpgrade || !upgradeOrder || upgradeOrder.status !== "pending") return;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        const response = await apiFetch(`/api/billing/orders/${upgradeOrder.id}`);
+        if (!response.ok) return;
+        const body = await response.json() as { order: BillingOrder };
+        setUpgradeOrder(body.order);
+        if (body.order.status === "paid") {
+          const me = await apiFetch("/api/me");
+          if (me.ok) {
+            const meBody = await me.json() as { user: AuthUser };
+            setUser(meBody.user);
+          }
+          setNotice("Thanh toán thành công — hạn mức đã được nâng cấp.");
+        }
+      })();
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [showUpgrade, upgradeOrder?.id, upgradeOrder?.status]);
+
   const generateSummary = async () => {
     if (!entries.length) return;
     setShowSummary(true);
     setIsSummarizing(true);
     setSummary("");
     try {
-      const response = await fetch("/api/summarize", {
+      const response = await apiFetch("/api/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ entries, outputLanguage: "vi", context }),
       });
-      const body = (await response.json()) as { summary?: string; error?: string };
-      if (!response.ok || !body.summary) throw new Error(body.error || "Không thể tạo biên bản.");
+      const body = (await response.json()) as { summary?: string; error?: string; user?: AuthUser; code?: string };
+      if (!response.ok || !body.summary) {
+        if (response.status === 402 || body.code === "quota_exhausted") {
+          if (body.user) setUser(body.user);
+          setShowSummary(false);
+          setNotice(body.error || "Đã hết hạn mức. Mua thêm để tạo biên bản.");
+          void openUpgrade();
+        }
+        throw new Error(body.error || "Không thể tạo biên bản.");
+      }
+      if (body.user) setUser(body.user);
       setSummary(body.summary);
     } catch (error) {
       setSummary(error instanceof Error ? error.message : "Không thể tạo biên bản.");
@@ -1256,6 +1847,37 @@ export default function App() {
     </section>
   );
 
+  if (!authReady) {
+    return (
+      <div className="access-gate">
+        <div className="access-stage">
+          <span className="brand-mark"><Icon name="spark" /></span>
+          <p className="access-kicker">Relay</p>
+          <p className="access-loading">Đang mở phiên…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (authRequired && !user) {
+    return (
+      <div className="access-gate">
+        <div className="access-stage">
+          <span className="brand-mark"><Icon name="spark" /></span>
+          <p className="access-kicker">AI Interpreter</p>
+          <h1>Relay</h1>
+          <p className="access-lead">Phiên dịch hội thoại trực tiếp. Dùng thử 30 phút miễn phí sau khi đăng nhập Google.</p>
+          {!googleClientId ? (
+            <p className="access-error">Server chưa cấu hình GOOGLE_CLIENT_ID.</p>
+          ) : (
+            <div className="google-button-slot" ref={googleButtonRef} />
+          )}
+          {authError ? <p className="access-error">{authError}</p> : null}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`app-shell text-size-${textSize} ${mobileHeaderCollapsed ? "mobile-header-collapsed" : ""} ${mobileMergedView ? "mobile-merged-view" : ""}`}>
       <header className="topbar">
@@ -1271,6 +1893,7 @@ export default function App() {
 
         <div className="top-actions">
           <span className={`api-pill ${apiConfigured ? "ready" : ""}`}><i />{apiConfigured ? "AI sẵn sàng" : "Chưa có API"}</span>
+          {renderAccountControls("top")}
           <button
             className="danger-action clear-all-action"
             onClick={clearConversation}
@@ -1326,6 +1949,7 @@ export default function App() {
           <time className="desktop-time">{formatTime(elapsed)}</time>
 
           <div className="desktop-actions">
+            {renderAccountControls("desktop")}
             <button className={voiceEnabled ? "active" : ""} onClick={() => setVoiceEnabled((value) => !value)} aria-label="Phát giọng dịch" title="Phát giọng dịch"><Icon name={voiceEnabled ? "volume" : "volumeOff"} /></button>
             <button onClick={exportTranscript} disabled={!entries.length} aria-label="Tải transcript" title="Tải transcript"><Icon name="download" /></button>
             <button onClick={() => void generateSummary()} disabled={!entries.length} aria-label="Biên bản AI" title="Biên bản AI"><Icon name="notes" /></button>
@@ -1466,6 +2090,22 @@ export default function App() {
 
         {notice && <div className="notice" role="alert"><span>!</span>{notice}<button onClick={() => setNotice(null)}>×</button></div>}
 
+        {quotaWarning !== "none" && user && !user.unlimited ? (
+          <div className={`quota-warning ${quotaWarning}`} role="status">
+            <span>
+              <strong>
+                {quotaWarning === "critical" ? "Sắp hết hạn mức" : "Hạn mức sắp hết"}
+              </strong>
+              {" · còn "}
+              {formatRemaining(user.remainingSeconds, false)}
+              {quotaWarning === "critical"
+                ? " — phiên sẽ tự dừng."
+                : " — mua thêm để không gián đoạn."}
+            </span>
+            <button type="button" onClick={() => void openUpgrade()}>Mua thêm</button>
+          </div>
+        ) : null}
+
         <div className={`transcript-grid ${mode}`}>
           {renderPanel(source, target, forwardEntries, "forward")}
           {mode === "two-way" && renderPanel(target, source, reverseEntries, "reverse")}
@@ -1484,6 +2124,90 @@ export default function App() {
         </footer>
       </main>
 
+      {showUpgrade && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowUpgrade(false)}>
+          <section className="modal-card upgrade-modal" role="dialog" aria-modal="true" aria-labelledby="upgrade-title" onMouseDown={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <span className="modal-icon"><Icon name="spark" /></span>
+                <div>
+                  <h2 id="upgrade-title">Mua thời gian sử dụng</h2>
+                  <p>Chọn gói rồi quét VietQR — hạn mức tự cộng sau khi chuyển khoản.</p>
+                </div>
+              </div>
+              <button onClick={() => setShowUpgrade(false)} aria-label="Đóng"><Icon name="close" /></button>
+            </header>
+            <div className="upgrade-body">
+              {upgradeError ? <p className="access-error">{upgradeError}</p> : null}
+
+              {!upgradeOrder && plans.length ? (
+                <div className="plan-grid">
+                  {plans.filter((plan) => plan.priceVnd > 0).map((plan) => {
+                    const active = selectedPlanId === plan.id;
+                    return (
+                      <button
+                        type="button"
+                        key={plan.id}
+                        className={`plan-card ${active ? "active" : ""}`}
+                        onClick={() => void openUpgrade(plan.id)}
+                        disabled={isCreatingOrder}
+                      >
+                        <span className="plan-card-kind">{plan.kind === "event" ? "Một lần" : "Hằng tháng"}</span>
+                        <strong>{plan.name}</strong>
+                        <span className="plan-card-price">{formatVnd(plan.priceVnd)}</span>
+                        <small>
+                          {plan.kind === "subscription"
+                            ? `+${formatRemaining(plan.monthlySeconds, plan.monthlySeconds === 0)} mỗi tháng`
+                            : `+${formatRemaining(plan.durationSeconds, false)} dùng một lần`}
+                        </small>
+                        <em>{plan.description}</em>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+
+              {isCreatingOrder ? <p className="upgrade-loading">Đang tạo mã QR…</p> : null}
+              {upgradeOrder ? (
+                <>
+                  <p className="upgrade-plan-label">
+                    Gói đã chọn: <strong>{upgradeOrder.planName || upgradeOrder.planId}</strong>
+                  </p>
+                  <img className="upgrade-qr" src={upgradeOrder.qrImageUrl} alt={`VietQR ${upgradeOrder.transferCode}`} />
+                  <div className="upgrade-meta">
+                    <p><strong>Số tiền:</strong> {formatVnd(upgradeOrder.amountVnd)}</p>
+                    <p><strong>Nội dung CK:</strong> <code>{upgradeOrder.transferCode}</code></p>
+                    <p><strong>Thụ hưởng:</strong> {upgradeOrder.bankAccountName} · {upgradeOrder.bankAccount}</p>
+                    <p className={`upgrade-status status-${upgradeOrder.status}`}>
+                      {upgradeOrder.status === "pending" && "Đang chờ thanh toán…"}
+                      {upgradeOrder.status === "paid" && "Đã thanh toán — hạn mức đã cập nhật."}
+                      {upgradeOrder.status === "expired" && "Đơn đã hết hạn. Tạo đơn mới để tiếp tục."}
+                    </p>
+                  </div>
+                  {upgradeOrder.status === "expired" ? (
+                    <button
+                      type="button"
+                      className="primary-button"
+                      onClick={() => void openUpgrade(upgradeOrder.planId || undefined)}
+                    >
+                      Tạo QR mới
+                    </button>
+                  ) : null}
+                  {upgradeOrder.status === "paid" ? (
+                    <button type="button" className="primary-button" onClick={() => setShowUpgrade(false)}>Tiếp tục dùng</button>
+                  ) : null}
+                  {upgradeOrder.status === "pending" ? (
+                    <button type="button" className="upgrade-other-plan" onClick={() => setUpgradeOrder(null)}>
+                      Chọn gói khác
+                    </button>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+          </section>
+        </div>
+      )}
+
       {showSettings && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowSettings(false)}>
           <section className="modal-card settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={(event) => event.stopPropagation()}>
@@ -1501,8 +2225,30 @@ export default function App() {
                 ))}
               </div>
             </div>
+            <div className="text-size-setting">
+              <span><strong>Giao diện</strong><small>{theme === "system" ? "Đang theo cài đặt hệ điều hành" : "Đã chọn cố định"}</small></span>
+              <div>
+                <button className={theme === "light" ? "active" : ""} onClick={() => setTheme("light")}>Sáng</button>
+                <button className={theme === "dark" ? "active" : ""} onClick={() => setTheme("dark")}>Tối</button>
+                <button className={theme === "system" ? "active" : ""} onClick={() => setTheme("system")}>Tự động</button>
+              </div>
+            </div>
             <label className="toggle-row"><span><strong>Gộp hội thoại trên mobile</strong><small>Hiển thị hai chiều trong một luồng theo thời gian</small></span><input type="checkbox" checked={mobileMergedView} onChange={(event) => setMobileMergedView(event.target.checked)} /></label>
             <label className="toggle-row"><span><strong>Phát giọng bản dịch</strong><small>Đọc bản dịch sau mỗi câu hoàn chỉnh</small></span><input type="checkbox" checked={voiceEnabled} onChange={(event) => setVoiceEnabled(event.target.checked)} /></label>
+            {user ? (
+              <div className="account-settings-row">
+                <span>
+                  <strong>{user.email}</strong>
+                  <small>{user.plan === "pro" ? "Gói Pro" : "Gói Free"} · còn {formatRemaining(user.remainingSeconds, user.unlimited)}</small>
+                </span>
+                <div>
+                  {user.plan !== "pro" ? (
+                    <button type="button" onClick={() => { setShowSettings(false); void openUpgrade(); }}>Nâng cấp</button>
+                  ) : null}
+                  <button type="button" className="logout-settings" onClick={() => void logout()}>Đăng xuất</button>
+                </div>
+              </div>
+            ) : null}
             <footer><button className="primary-button" onClick={() => setShowSettings(false)}>Lưu cài đặt</button></footer>
           </section>
         </div>
